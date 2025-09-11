@@ -1,0 +1,48 @@
+services:
+  backend:
+    build: null
+    image: node:20 # <-- switch from node:20-alpine
+    working_dir: /app
+    volumes:
+      - ../backend:/app
+      - /app/node_modules
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      DATABASE_URL: postgresql://cc:cc@postgres:5432/ccdb
+      ML_SVC_URL: http://ml-svc:8000
+    depends_on:
+      - postgres
+    ports:
+      - "3000:3000"
+    command: >
+      sh -c " npm ci && npm run prisma:generate && npx prisma migrate deploy && npm run dev "
+
+  ml-svc:
+    build: null # <— disables any prod build
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ../ml-svc:/app
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8000:8000"
+    command: >
+      sh -c " pip install --no-cache-dir -r requirements.txt && uvicorn app:app --host 0.0.0.0 --port 8000 --reload "
+
+  frontend:
+    build: null # <— disables the prod FE Dockerfile build
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ../frontend:/app
+      - /app/node_modules
+    environment:
+      VITE_API_BASE: http://localhost:3000
+      NODE_ENV: development
+    ports:
+      - "5173:5173"
+    command: >
+      sh -c " npm ci && npm run dev -- --host 0.0.0.0 --port 5173 "

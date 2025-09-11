@@ -1,0 +1,73 @@
+generator client {
+    provider = "prisma-client-js"
+}
+
+datasource db {
+    provider = "postgresql"
+    url      = env("DATABASE_URL")
+}
+
+enum Frequency {
+    monthly
+    quarterly
+    annual
+}
+
+model Indicator {
+    id        Int      @id @default(autoincrement())
+    code      String   @unique
+    name      String
+    unit      String?
+    source    String?
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+    series    Series[]
+}
+
+model Series {
+    id           Int           @id @default(autoincrement())
+    indicatorId  Int
+    indicator    Indicator     @relation(fields: [indicatorId], references: [id])
+    region       String?
+    frequency    Frequency
+    extraMeta    Json?
+    createdAt    DateTime      @default(now())
+    updatedAt    DateTime      @updatedAt
+    observations Observation[]
+}
+
+model Observation {
+    id        Int      @id @default(autoincrement())
+    seriesId  Int
+    series    Series   @relation(fields: [seriesId], references: [id])
+    date      DateTime
+    value     Decimal  @db.Decimal(18, 4)
+    createdAt DateTime @default(now())
+
+    @@unique([seriesId, date])
+    @@index([seriesId, date])
+}
+
+model AnalysisRun {
+    id         Int            @id @default(autoincrement())
+    createdAt  DateTime       @default(now())
+    method     String // 'pearson' | 'spearman'
+    maxLag     Int
+    minOverlap Int
+    edgeMin    Float
+    seriesIds  String // comma-separated list for traceability
+    edges      AnalysisEdge[]
+}
+
+model AnalysisEdge {
+    id       Int         @id @default(autoincrement())
+    runId    Int
+    run      AnalysisRun @relation(fields: [runId], references: [id])
+    sourceId Int // Series.id
+    targetId Int // Series.id
+    lag      Int
+    weight   Float
+
+    @@index([runId])
+    @@index([sourceId, targetId])
+}
