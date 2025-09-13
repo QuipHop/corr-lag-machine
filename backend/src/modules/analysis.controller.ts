@@ -1,71 +1,131 @@
-import { Body, Controller, Get, HttpException, Param, Post } from '@nestjs/common';
+import { Body, Controller, Post } from '@nestjs/common';
 import { PrismaService } from '../shared/prisma.service';
-import axios from 'axios';
+import { CorrelationService } from '../corellation/correlation.service';
+import { toStringIds } from '../shared/utils';
 
+type GraphReq = {
+    datasetId: string;
+    /** Optional: series keys; if omitted, we use ALL series in dataset */
+    series?: string[];
+    method?: 'spearman' | 'pearson';     // default 'spearman'
+    pearsonAlso?: boolean;             // default false
+    minOverlap?: number;               // default 6
+    edgeMin?: number;                  // default 0.5 (abs threshold)
+};
 
-@Controller('analysis')
+@Controller('api/analysis')
 export class AnalysisController {
-    constructor(private prisma: PrismaService) { }
+    constructor(
+        private prisma: PrismaService,
+        private corr: CorrelationService,
+    ) { }
 
+    /** Build & persist a correlation graph into AnalysisRun/AnalysisEdge */
+    @Post('graph')
+    async graph(@Body() body: GraphReq) {
+        const datasetId = body.datasetId;
+        const method = body.method ?? 'spearman';
+        const pearsonAlso = body.pearsonAlso ?? false;
+        const minOverlap = body.minOverlap ?? 6;
+        const edgeMin = body.edgeMin ?? 0.5;
 
-    @Post('run')
-    async run(@Body() body: { seriesIds: number[]; maxLag?: number; method?: 'pearson' | 'spearman'; minOverlap?: number; edgeMin?: number }) {
-        const { seriesIds, maxLag = 12, method = 'pearson', minOverlap = 12, edgeMin = 0.3 } = body;
-        if (!seriesIds?.length) throw new HttpException('seriesIds required', 400);
+        // Get series KEYS to analyze
+        const seriesKeys = Array.isArray(body.series) && body.series.length
+            ? body.series
+            : (await this.prisma.series.findMany({
+                where: { datasetId },
+                select: { key: true },
+            })).map(s => s.key);
 
-
-        // fetch series + points for ML
-        const series = await this.prisma.series.findMany({ where: { id: { in: seriesIds } }, include: { indicator: true } });
-        const payload = [] as any[];
-        for (const s of series) {
-            const points = await this.prisma.observation.findMany({ where: { seriesId: s.id }, orderBy: { date: 'asc' }, select: { date: true, value: true } });
-            payload.push({ id: s.id, code: `${s.indicator.code}${s.region ? ':' + s.region : ''}`, points: points.map(p => ({ date: p.date.toISOString().slice(0, 10), value: Number(p.value) })) });
+        if (seriesKeys.length < 2) {
+            return { runId: null, edges: [], message: 'Need at least 2 series' };
         }
 
+        // Compute correlations
+        const result = await this.corr.run({
+            datasetId,
+            series: seriesKeys,
+            method,
+            pearsonAlso,
+        });
 
-        const mlUrl = `${process.env.ML_SVC_URL || 'http://localhost:8000'}/corr-lag`;
-        const { data } = await axios.post(mlUrl, { series: payload, maxLag, method, minOverlap, edgeMin });
+        // Map series.key -> series.id
+        const series = await this.prisma.series.findMany({
+            where: { datasetId, key: { in: seriesKeys } },
+            select: { id: true, key: true },
+        });
+        const idByKey = new Map(series.map(s => [s.key, s.id]));
 
+        // Filter edges
+        const edges = result.pairs
+            .filter(p => p.n >= minOverlap)
+            .map(p => {
+                const r = method === 'pearson' ? (p.pearson ?? 0) : (p.spearman ?? 0);
+                return { ...p, r, abs: Math.abs(r) };
+            })
+            .filter(p => p.abs >= edgeMin)
+            .map(p => ({
+                sourceId: idByKey.get(p.x)!,
+                targetId: idByKey.get(p.y)!,
+                lag: 0,
+                weight: p.r,
+            }))
+            // Drop any null mappings (shouldn’t happen, but safe)
+            .filter(e => !!e.sourceId && !!e.targetId);
 
-        // persist run + edges
+        // Persist run + edges
         const run = await this.prisma.analysisRun.create({
             data: {
                 method,
-                maxLag,
+                maxLag: 0,
                 minOverlap,
                 edgeMin,
-                seriesIds: seriesIds.join(','),
+                seriesIds: series.map(s => s.id).join(','),
             },
         });
 
-
-        if (Array.isArray(data?.edges)) {
-            const mapByCode = new Map(series.map(s => [`${s.indicator.code}${s.region ? ':' + s.region : ''}`, s.id] as const));
-            const rows = data.edges.map((e: any) => ({ runId: run.id, sourceId: mapByCode.get(e.source)!, targetId: mapByCode.get(e.target)!, lag: e.lag, weight: e.weight }));
-            // transaction bulk insert
-            await this.prisma.$transaction(rows.map((r: any) => this.prisma.analysisEdge.create({ data: r })));
+        if (edges.length) {
+            await this.prisma.analysisEdge.createMany({
+                data: edges.map(e => ({ ...e, runId: run.id })),
+            });
         }
 
-
-        return { runId: run.id, nodes: data?.nodes ?? [], edges: data?.edges ?? [] };
+        return {
+            runId: run.id,
+            datasetId,
+            method,
+            minOverlap,
+            edgeMin,
+            edgesInserted: edges.length,
+        };
     }
 
+    /** Optional helper: remap a mixed seriesIds payload (string|number[]|CSV) */
+    @Post('payload')
+    async makePayload(@Body() body: any) {
+        const seriesIds = toStringIds(body?.seriesIds);
+        if (!seriesIds.length) return { series: [], mapByCode: {} };
 
-    @Get(':runId')
-    async get(@Param('runId') runId: string) {
-        const id = Number(runId);
-        const run = await this.prisma.analysisRun.findUnique({ where: { id } });
-        if (!run) throw new HttpException('not found', 404);
-        const edges = await this.prisma.analysisEdge.findMany({ where: { runId: id } });
-        return { run, edges };
-    }
+        const series = await this.prisma.series.findMany({
+            where: { id: { in: seriesIds } },
+            include: { indicator: true } as const,
+        });
 
-
-    @Get('latest/one')
-    async latest() {
-        const run = await this.prisma.analysisRun.findFirst({ orderBy: { id: 'desc' } });
-        if (!run) return { run: null, edges: [] };
-        const edges = await this.prisma.analysisEdge.findMany({ where: { runId: run.id } });
-        return { run, edges };
+        const payload = [];
+        for (const s of series) {
+            const obs = await this.prisma.observation.findMany({
+                where: { seriesId: s.id },
+                orderBy: { date: 'asc' },
+                select: { date: true, value: true },
+            });
+            const code = s.indicator?.code ?? s.key;
+            payload.push({
+                id: s.id,
+                code,
+                points: obs.map(o => ({ date: o.date.toISOString().slice(0, 10), value: Number(o.value) })),
+            });
+        }
+        const mapByCode = Object.fromEntries(series.map(s => [(s.indicator?.code ?? s.key), s.id]));
+        return { series: payload, mapByCode };
     }
 }

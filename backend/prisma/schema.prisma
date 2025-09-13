@@ -1,73 +1,97 @@
 generator client {
-    provider = "prisma-client-js"
+  provider = "prisma-client-js"
 }
 
 datasource db {
-    provider = "postgresql"
-    url      = env("DATABASE_URL")
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 enum Frequency {
-    monthly
-    quarterly
-    annual
+  monthly
+  quarterly
+  annual
+}
+
+model Dataset {
+  id          String    @id @default(cuid())
+  name        String
+  freq        Frequency @default(monthly)
+  mappingJson Json?
+  createdAt   DateTime  @default(now())
+  Series      Series[]
 }
 
 model Indicator {
-    id        Int      @id @default(autoincrement())
-    code      String   @unique
-    name      String
-    unit      String?
-    source    String?
-    createdAt DateTime @default(now())
-    updatedAt DateTime @updatedAt
-    series    Series[]
+  id        Int      @id @default(autoincrement())
+  code      String   @unique
+  name      String
+  unit      String?
+  source    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  Series    Series[] // 1:N to Series
 }
 
 model Series {
-    id           Int           @id @default(autoincrement())
-    indicatorId  Int
-    indicator    Indicator     @relation(fields: [indicatorId], references: [id])
-    region       String?
-    frequency    Frequency
-    extraMeta    Json?
-    createdAt    DateTime      @default(now())
-    updatedAt    DateTime      @updatedAt
-    observations Observation[]
+  id          String   @id @default(cuid())
+  datasetId   String
+  key         String
+  label       String?
+  units       String?
+  indicatorId Int?
+  createdAt   DateTime @default(now())
+
+  dataset      Dataset       @relation(fields: [datasetId], references: [id])
+  indicator    Indicator?    @relation(fields: [indicatorId], references: [id])
+  observations Observation[]
+
+  // back-relations for edges
+  outgoingEdges AnalysisEdge[] @relation("EdgeSource")
+  incomingEdges AnalysisEdge[] @relation("EdgeTarget")
+
+  @@unique([datasetId, key])
 }
 
 model Observation {
-    id        Int      @id @default(autoincrement())
-    seriesId  Int
-    series    Series   @relation(fields: [seriesId], references: [id])
-    date      DateTime
-    value     Decimal  @db.Decimal(18, 4)
-    createdAt DateTime @default(now())
+  id        Int      @id @default(autoincrement())
+  seriesId  String // <-- String to match Series.id
+  series    Series   @relation(fields: [seriesId], references: [id])
+  date      DateTime
+  value     Decimal  @db.Decimal(18, 4)
+  createdAt DateTime @default(now())
 
-    @@unique([seriesId, date])
-    @@index([seriesId, date])
+  @@unique([seriesId, date])
+  @@index([seriesId, date])
 }
 
 model AnalysisRun {
-    id         Int            @id @default(autoincrement())
-    createdAt  DateTime       @default(now())
-    method     String // 'pearson' | 'spearman'
-    maxLag     Int
-    minOverlap Int
-    edgeMin    Float
-    seriesIds  String // comma-separated list for traceability
-    edges      AnalysisEdge[]
+  id         Int            @id @default(autoincrement())
+  createdAt  DateTime       @default(now())
+  method     String // 'pearson' | 'spearman'
+  maxLag     Int
+  minOverlap Int
+  edgeMin    Float
+  seriesIds  String
+  edges      AnalysisEdge[]
 }
 
 model AnalysisEdge {
-    id       Int         @id @default(autoincrement())
-    runId    Int
-    run      AnalysisRun @relation(fields: [runId], references: [id])
-    sourceId Int // Series.id
-    targetId Int // Series.id
-    lag      Int
-    weight   Float
+  id    Int         @id @default(autoincrement())
+  runId Int
+  run   AnalysisRun @relation(fields: [runId], references: [id])
 
-    @@index([runId])
-    @@index([sourceId, targetId])
+  // Series.id is String; set FKs to String
+  sourceId String
+  targetId String
+
+  // Two separate relations to Series with names
+  source Series @relation("EdgeSource", fields: [sourceId], references: [id])
+  target Series @relation("EdgeTarget", fields: [targetId], references: [id])
+
+  lag    Int
+  weight Float
+
+  @@index([runId])
+  @@index([sourceId, targetId])
 }

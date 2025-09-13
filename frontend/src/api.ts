@@ -1,29 +1,28 @@
-import type { CorrLagRes, Point, SeriesMeta } from "./types";
+const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:3000';
+const API_PREFIX = '/api';
 
-const BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:3000';
+const full = (p: string) => `${API_BASE}${API_PREFIX}${p}`;
 
-
-export async function fetchSeriesMeta(id: number): Promise<SeriesMeta> {
-  const r = await fetch(`${BASE}/series/${id}`);
-  if (!r.ok) throw new Error(`Failed to load series ${id}`);
-  return r.json();
+export async function getJSON<T>(path: string): Promise<T> {
+  const res = await fetch(full(path));
+  if (!res.ok) throw new Error(await res.text());
+  return res.json() as Promise<T>;
 }
 
-
-export async function fetchSeriesData(id: number, from?: string, to?: string): Promise<{ seriesId: number; points: Point[] }> {
-  const u = new URL(`${BASE}/series/${id}/data`);
-  if (from) u.searchParams.set('from', from);
-  if (to) u.searchParams.set('to', to);
-  const r = await fetch(u);
-  if (!r.ok) throw new Error(`Failed to load series data ${id}`);
-  return r.json();
+export async function postJSON<T>(path: string, body: any, headers: Record<string, string> = {}): Promise<T> {
+  const res = await fetch(full(path), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json() as Promise<T>;
 }
 
-
-export async function corrLag
-  (seriesIds: number[], params: { maxLag?: number; method?: 'pearson' | 'spearman'; minOverlap?: number; edgeMin?: number } = {}): Promise<CorrLagRes> {
-  const body = JSON.stringify({ seriesIds, ...params });
-  const r = await fetch(`${BASE}/ml/corr-lag`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
-  if (!r.ok) throw new Error('corr-lag failed');
-  return r.json();
+export async function postFile<T = any>(path: string, file: File): Promise<T> {
+  const fd = new FormData();
+  fd.append('file', file);
+  const res = await fetch(full(path), { method: 'POST', body: fd });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json() as Promise<T>;
 }

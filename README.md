@@ -1,7 +1,7 @@
 # 0) ensure Docker Desktop is running
 
 # 1) DB + Adminer
-cd infra
+cd infra01
 docker compose up -d postgres adminer
 
 # 2) Apps with hot-reload

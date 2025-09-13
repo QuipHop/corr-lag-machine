@@ -1,33 +1,39 @@
-import { Body, Controller, Post } from '@nestjs/common';
+import { Body, Controller, NotFoundException, Post } from '@nestjs/common';
 import { PrismaService } from '../shared/prisma.service';
 
-
-type ObservationInput = {
-    seriesId: number;
-    date: string; // ISO date
+type UpsertItem = {
+    seriesId: string | number;
+    date: string;   // ISO yyyy-mm-dd or yyyy-mm
     value: number | string;
 };
 
-
-@Controller('observations')
+@Controller('api/observations')
 export class ObservationsController {
     constructor(private prisma: PrismaService) { }
 
+    /** Bulk upsert observations. Accepts array of { seriesId, date, value }. */
+    @Post('bulk-upsert')
+    async bulkUpsert(@Body() body: { items: UpsertItem[] }) {
+        if (!body?.items?.length) return { upserts: 0 };
 
-    @Post('bulk')
-    async bulk(@Body() body: { items: ObservationInput[] }) {
-        const items = body.items ?? [];
-        if (!items.length) return { inserted: 0 };
+        let count = 0;
 
+        for (const it of body.items) {
+            const sid = String(it.seriesId); // <-- critical: Series.id is STRING
+            // Allow yyyy-MM, normalize to yyyy-MM-01 for monthly
+            const dateStr = /^\d{4}-\d{2}$/.test(it.date) ? `${it.date}-01` : it.date;
+            const d = new Date(dateStr);
+            if (isNaN(d.getTime())) throw new NotFoundException(`Bad date: ${it.date}`);
 
-        const tx = items.map((it) =>
-            this.prisma.observation.upsert({
-                where: { seriesId_date: { seriesId: it.seriesId, date: new Date(it.date) } },
+            await this.prisma.observation.upsert({
+                where: { seriesId_date: { seriesId: sid, date: d } },
                 update: { value: it.value as any },
-                create: { seriesId: it.seriesId, date: new Date(it.date), value: it.value as any },
-            }),
-        );
-        await this.prisma.$transaction(tx);
-        return { inserted: items.length };
+                create: { seriesId: sid, date: d, value: it.value as any },
+            });
+
+            count++;
+        }
+
+        return { upserts: count };
     }
 }

@@ -1,26 +1,55 @@
 services:
-  backend:
-    build: null
-    image: node:20 # <-- switch from node:20-alpine
-    working_dir: /app
+  postgres:
+    image: postgres:16-alpine
+    container_name: cc-postgres
+    environment:
+      POSTGRES_DB: ccdb
+      POSTGRES_USER: cc
+      POSTGRES_PASSWORD: cc
+    ports:
+      - "5432:5432"
     volumes:
-      - ../backend:/app
-      - /app/node_modules
+      - dbdata:/var/lib/postgresql/data
+
+  adminer:
+    image: adminer:latest
+    container_name: cc-adminer
+    depends_on:
+      - postgres
+    ports:
+      - "8080:8080"
+
+  backend:
+    image: node:20
+    container_name: cc-backend
+    working_dir: /app
+    depends_on:
+      - postgres
     environment:
       NODE_ENV: development
       PORT: 3000
       DATABASE_URL: postgresql://cc:cc@postgres:5432/ccdb
       ML_SVC_URL: http://ml-svc:8000
-    depends_on:
-      - postgres
+      # help watchers in Docker
+      CHOKIDAR_USEPOLLING: "1"
+      CHOKIDAR_INTERVAL: "500"
+      WATCHPACK_POLLING: "true"
+    volumes:
+      - ../backend:/app
+      - /app/node_modules
     ports:
       - "3000:3000"
     command: >
-      sh -c " npm ci && npm run prisma:generate && npx prisma migrate deploy && npm run dev "
+      sh -c "
+        npm ci &&
+        npm run prisma:generate &&
+        npx prisma migrate deploy &&
+        npm run dev
+      "
 
   ml-svc:
-    build: null # <— disables any prod build
     image: python:3.11-slim
+    container_name: cc-mlsvc
     working_dir: /app
     volumes:
       - ../ml-svc:/app
@@ -30,19 +59,35 @@ services:
     ports:
       - "8000:8000"
     command: >
-      sh -c " pip install --no-cache-dir -r requirements.txt && uvicorn app:app --host 0.0.0.0 --port 8000 --reload "
+      sh -c "
+        pip install --no-cache-dir -r requirements.txt &&
+        uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+      "
 
   frontend:
-    build: null # <— disables the prod FE Dockerfile build
     image: node:20-alpine
+    container_name: cc-frontend
     working_dir: /app
+    depends_on:
+      - backend
+    environment:
+      NODE_ENV: development
+      # Browser calls the backend via host port 3000
+      VITE_API_BASE: http://localhost:3000
+      # Vite file watching in Docker
+      CHOKIDAR_USEPOLLING: "1"
+      CHOKIDAR_INTERVAL: "500"
+      WATCHPACK_POLLING: "true"
     volumes:
       - ../frontend:/app
       - /app/node_modules
-    environment:
-      VITE_API_BASE: http://localhost:3000
-      NODE_ENV: development
     ports:
       - "5173:5173"
     command: >
-      sh -c " npm ci && npm run dev -- --host 0.0.0.0 --port 5173 "
+      sh -c "
+        npm ci &&
+        npm run dev -- --host 0.0.0.0 --port 5173
+      "
+
+volumes:
+  dbdata:

@@ -1,71 +1,168 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { fetchSeriesData, fetchSeriesMeta } from '../api';
-import type { Point, SeriesMeta } from '../types';
-import { LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer } from 'recharts';
+import { useEffect, useMemo, useState } from 'react';
+import {
+  listDatasets, createDataset, uploadFile, previewUpload, commitUpload, getSavedMapping
+} from './api.series';
+import type { DatasetLite, PreviewReq, PreviewResp, CommitResp } from '../types';
 
-function formatDate(iso: string) {
-  return new Date(iso).toISOString().slice(0, 10);
-}
-
-export default function SeriesPanel({ presets, onUpdatePresets }: { presets: number[]; onUpdatePresets: (ids: number[]) => void }) {
-  const [idInput, setIdInput] = useState<string>(String(presets[0] ?? ''));
-  const [meta, setMeta] = useState<SeriesMeta | null>(null);
-  const [data, setData] = useState<Point[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-
-  async function load(id: number) {
-    setError(null); setLoading(true);
-    try {
-      const m = await fetchSeriesMeta(id);
-      setMeta(m);
-      const d = await fetchSeriesData(id);
-      const cooked = d.points.map(p => ({ ...p, date: formatDate(p.date) }));
-      setData(cooked);
-      if (!presets.includes(id)) onUpdatePresets([...presets, id]);
-    } catch (e: any) {
-      setMeta(null); setData([]);
-      setError(e?.message ?? 'Failed to load');
-    } finally {
-      setLoading(false);
-    }
-  }
-
+export default function SeriesPanel() {
+  const [datasets, setDatasets] = useState<DatasetLite[]>([]);
+  const [datasetId, setDatasetId] = useState<string>('');
+  const [uploadId, setUploadId] = useState<string>('');
+  const [columns, setColumns] = useState<{ name: string; typeGuess: 'date' | 'number'; examples: string[] }[]>([]);
+  const [mapping, setMapping] = useState<PreviewReq>({
+    dateColumn: '',
+    valueColumns: [],
+    decimal: 'auto',
+    dateFormat: 'YYYY-MM',
+    dropBlanks: true,
+  });
+  const [preview, setPreview] = useState<PreviewResp | null>(null);
+  const [commit, setCommit] = useState<CommitResp | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
 
   useEffect(() => {
-    if (presets.length) load(presets[0]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    listDatasets().then(ds => {
+      setDatasets(ds);
+      if (ds[0]) setDatasetId(ds[0].id);
+    }).catch(e => setErr(e.message ?? String(e)));
   }, []);
 
+  useEffect(() => {
+    if (!datasetId) return;
+    // prefill from saved mapping if any
+    getSavedMapping(datasetId).then(m => {
+      if (!m || !Object.keys(m).length) return;
+      const as = m as any;
+      setMapping({
+        dateColumn: as.dateColumn ?? '',
+        valueColumns: Array.isArray(as.valueColumns) ? as.valueColumns : [],
+        decimal: as.decimal ?? 'auto',
+        dateFormat: as.dateFormat ?? 'YYYY-MM',
+        dropBlanks: as.dropBlanks ?? true,
+      });
+    }).catch(() => { });
+  }, [datasetId]);
 
-  const unit = meta?.indicator?.unit ?? '';
-  const title = meta ? `${meta.indicator.code}${meta.region ? ' — ' + meta.region : ''}` : 'Series';
+  const numberColumns = useMemo(() => columns.filter(c => c.typeGuess === 'number'), [columns]);
+
+  const onCreateDataset = async () => {
+    setBusy(true); setErr('');
+    try {
+      const ds = await createDataset({ name: `Dataset ${new Date().toISOString().slice(0, 10)}`, freq: 'monthly' });
+      setDatasets(d => [ds, ...d]); setDatasetId(ds.id);
+    } catch (e: any) { setErr(e.message ?? String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const onPickFile = async (f: File) => {
+    if (!datasetId) return;
+    setBusy(true); setErr(''); setPreview(null); setCommit(null);
+    try {
+      const up = await uploadFile(datasetId, f);
+      setUploadId(up.uploadId);
+      setColumns(up.columns);
+      const dateGuess = up.columns.find(c => c.typeGuess === 'date')?.name ?? up.columns[0]?.name ?? '';
+      const vals = up.columns.filter(c => c.typeGuess === 'number').slice(0, 3);
+      setMapping(m => ({ ...m, dateColumn: dateGuess, valueColumns: vals.map(v => ({ name: v.name, key: v.name.toUpperCase() })) }));
+    } catch (e: any) { setErr(e.message ?? String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const onPreview = async () => {
+    setBusy(true); setErr('');
+    try {
+      const p = await previewUpload(uploadId, mapping);
+      setPreview(p);
+    } catch (e: any) { setErr(e.message ?? String(e)); }
+    finally { setBusy(false); }
+  };
+
+  const onCommit = async () => {
+    setBusy(true); setErr('');
+    try {
+      const c = await commitUpload(uploadId, { saveMappingToDataset: true, createSeries: true, upsertMode: 'merge' });
+      setCommit(c);
+    } catch (e: any) { setErr(e.message ?? String(e)); }
+    finally { setBusy(false); }
+  };
 
   return (
-    <div>
-      <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-        <input value={idInput} onChange={e => setIdInput(e.target.value)} placeholder="Series ID" />
-        <button onClick={() => { const n = Number(idInput); if (!Number.isNaN(n)) load(n); }}>Load</button>
+    <div style={{ padding: 12 }}>
+      <h3>Upload → Preview → Commit</h3>
+      {err && <div style={{ color: '#c33' }}>{err}</div>}
+
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <label>Dataset:&nbsp;</label>
+        <select value={datasetId} onChange={e => setDatasetId(e.target.value)}>
+          {datasets.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+        </select>
+        <button onClick={onCreateDataset} disabled={busy}>+ New dataset</button>
       </div>
-      {loading && <div className="muted">Loading…</div>}
-      {error && <div style={{ color: '#ffa7a7' }}>{error}</div>}
-      {meta && (
-        <div style={{ marginBottom: 12 }}>
-          <div className="pill">{meta.frequency}</div> <strong>{title}</strong> <span className="muted">[{unit}]</span>
+
+      <div style={{ marginTop: 8 }}>
+        <input type="file"
+          accept=".csv,.xls,.xlsx,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+          onChange={e => e.target.files?.[0] && onPickFile(e.target.files[0])} />
+      </div>
+
+      {!!columns.length && (
+        <div style={{ marginTop: 10 }}>
+          <div>Date column:&nbsp;
+            <select value={mapping.dateColumn} onChange={e => setMapping(m => ({ ...m, dateColumn: e.target.value }))}>
+              {columns.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
+            </select>
+          </div>
+
+          <div style={{ marginTop: 6 }}>
+            Decimal:&nbsp;
+            <select value={mapping.decimal} onChange={e => setMapping(m => ({ ...m, decimal: e.target.value as any }))}>
+              <option value="auto">auto</option>
+              <option value="dot">dot</option>
+              <option value="comma">comma</option>
+            </select>
+          </div>
+
+          <div style={{ marginTop: 8 }}>
+            Value columns:
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+              {numberColumns.map(c => {
+                const inc = mapping.valueColumns.some(v => v.name === c.name);
+                return (
+                  <button key={c.name}
+                    onClick={() => setMapping(m => {
+                      const exists = m.valueColumns.some(v => v.name === c.name);
+                      return exists ? { ...m, valueColumns: m.valueColumns.filter(v => v.name !== c.name) }
+                        : { ...m, valueColumns: [...m.valueColumns, { name: c.name, key: c.name.toUpperCase() }] };
+                    })}
+                    style={{ padding: '4px 8px', borderRadius: 8, border: '1px solid #ccc', background: inc ? '#eef' : '#fff' }}>
+                    {c.name}{inc ? ' ✓' : ''}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <button style={{ marginTop: 10 }} onClick={onPreview} disabled={busy || !mapping.dateColumn || mapping.valueColumns.length === 0}>Preview</button>
         </div>
       )}
-      <div style={{ height: 300 }} className="card">
-        <ResponsiveContainer width="100%" height="100%">
-          <LineChart data={data} margin={{ top: 10, right: 16, bottom: 0, left: 0 }}>
-            <CartesianGrid strokeDasharray="3 3" />
-            <XAxis dataKey="date" tick={{ fontSize: 12 }} interval={'preserveStartEnd'} />
-            <YAxis tick={{ fontSize: 12 }} />
-            <Tooltip />
-            <Line type="monotone" dataKey="value" dot={false} strokeWidth={2} />
-          </LineChart>
-        </ResponsiveContainer>
-      </div>
+
+      {preview && (
+        <div style={{ marginTop: 12 }}>
+          <div style={{ color: '#666' }}>Warnings: {preview.warnings.length ? preview.warnings.join('; ') : 'none'}</div>
+          {preview.normalized.series.map(s => (
+            <div key={s.key} style={{ marginTop: 8 }}>
+              <b>{s.key}</b> — {s.rowCount} rows
+              <pre style={{ fontFamily: 'monospace', fontSize: 12 }}>
+                {s.rows.slice(0, 8).map(r => `${r.date}  ${r.value}`).join('\n')}
+                {s.rowCount > 8 ? '\n…' : ''}
+              </pre>
+            </div>
+          ))}
+          <button onClick={onCommit} disabled={busy} style={{ marginTop: 6 }}>Commit</button>
+          {commit && <div style={{ color: '#2a6', marginTop: 6 }}>Upserted {commit.pointsUpserted} points; created: {commit.seriesCreated.join(', ') || '—'}</div>}
+        </div>
+      )}
     </div>
   );
 }

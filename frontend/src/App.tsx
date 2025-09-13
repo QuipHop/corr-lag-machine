@@ -1,32 +1,29 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import SeriesPanel from './ui/SeriesPanel';
+import SeriesBrowser from './ui/SeriesBrowser';
+import GraphPanel from './ui/GraphPanel';
 import CorrLagPanel from './ui/CorrLagPanel';
+import './App.css';
 
+type Tab = 'upload' | 'browse' | 'graph' | 'lag';
 
 export default function App() {
-  const [knownIds, setKnownIds] = useState<number[]>([0, 1]); // your current two
+  const [tab, setTab] = useState<Tab>('upload');
+  console.log("SSS");
   return (
-    <div className="container">
-      <h1 style={{ marginBottom: 8 }}>Cascade Correlations — MVP</h1>
-      <div className="muted" style={{ marginBottom: 16 }}>API base: {import.meta.env.VITE_API_BASE ?? 'http://localhost:3000'}</div>
-
-
-      <div className="row">
-        <div className="card" style={{ flex: 1, minWidth: 320 }}>
-          <h2>Series quick access</h2>
-          <p className="muted">Enter an ID and view the time series. Presets: {knownIds.join(', ')}.</p>
-          <SeriesPanel presets={knownIds} onUpdatePresets={setKnownIds} />
-        </div>
-
-
-        <div className="card" style={{ flex: 1, minWidth: 420 }}>
-          <h2>Correlation (lagged)</h2>
-          <CorrLagPanel defaultIds={knownIds} />
-        </div>
+    <div style={{ maxWidth: 1100, margin: '0 auto', padding: 12 }}>
+      <h2>Macro Correlations v1</h2>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+        <button onClick={() => setTab('upload')} style={{ fontWeight: tab === 'upload' ? 700 : 400 }}>Upload</button>
+        <button onClick={() => setTab('browse')} style={{ fontWeight: tab === 'browse' ? 700 : 400 }}>Browse</button>
+        <button onClick={() => setTab('graph')} style={{ fontWeight: tab === 'graph' ? 700 : 400 }}>Graph</button>
+        <button onClick={() => setTab('lag')} style={{ fontWeight: tab === 'lag' ? 700 : 400 }}>Lag</button>
       </div>
 
-
-      <div style={{ marginTop: 24 }} className="muted">Tip: you can change presets any time — useful once you add real datasets.</div>
+      {tab === 'upload' && <SeriesPanel />}
+      {tab === 'browse' && <SeriesBrowser />}
+      {tab === 'graph' && <GraphPanel />}
+      {tab === 'lag' && <CorrLagPanel />}
     </div>
   );
 }
