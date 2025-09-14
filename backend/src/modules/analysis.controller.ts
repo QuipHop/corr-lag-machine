@@ -1,4 +1,4 @@
-import { Body, Controller, Post } from '@nestjs/common';
+import { Body, Controller, Get, NotFoundException, Param, Post, Query } from '@nestjs/common';
 import { PrismaService } from '../shared/prisma.service';
 import { CorrelationService } from '../corellation/correlation.service';
 import { toStringIds } from '../shared/utils';
@@ -81,6 +81,7 @@ export class AnalysisController {
                 minOverlap,
                 edgeMin,
                 seriesIds: series.map(s => s.id).join(','),
+                datasetId,
             },
         });
 
@@ -127,5 +128,58 @@ export class AnalysisController {
         }
         const mapByCode = Object.fromEntries(series.map(s => [(s.indicator?.code ?? s.key), s.id]));
         return { series: payload, mapByCode };
+    }
+
+    @Get('runs')
+    async listRuns(@Query('datasetId') datasetId?: string) {
+        const runs = await this.prisma.analysisRun.findMany({
+            where: datasetId ? { datasetId } : undefined,
+            orderBy: { id: 'desc' },
+            include: { edges: { select: { id: true } } },
+        });
+        return runs.map(r => ({
+            id: r.id,
+            datasetId: r.datasetId,
+            createdAt: r.createdAt,
+            method: r.method,
+            minOverlap: r.minOverlap,
+            edgeMin: r.edgeMin,
+            edgeCount: r.edges.length,
+        }));
+    }
+
+    /** Get a run with edges resolved to series keys */
+    @Get('run/:id')
+    async getRun(@Param('id') id: string) {
+        const runId = Number(id);
+        const run = await this.prisma.analysisRun.findUnique({
+            where: { id: runId },
+            include: { edges: true },
+        });
+        if (!run) throw new NotFoundException('Run not found');
+
+        const seriesIds = Array.from(new Set(run.edges.flatMap(e => [e.sourceId, e.targetId])));
+        const series = await this.prisma.series.findMany({
+            where: { id: { in: seriesIds } },
+            select: { id: true, key: true, label: true },
+        });
+        const keyById = new Map(series.map(s => [s.id, s.key]));
+
+        return {
+            id: run.id,
+            datasetId: run.datasetId,
+            createdAt: run.createdAt,
+            method: run.method,
+            minOverlap: run.minOverlap,
+            edgeMin: run.edgeMin,
+            edges: run.edges.map(e => ({
+                sourceId: e.sourceId,
+                targetId: e.targetId,
+                sourceKey: keyById.get(e.sourceId) ?? e.sourceId,
+                targetKey: keyById.get(e.targetId) ?? e.targetId,
+                lag: e.lag,
+                weight: e.weight,
+            })),
+        };
     }
 }

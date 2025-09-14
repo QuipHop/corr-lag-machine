@@ -51,3 +51,24 @@ export type PersistGraphResp = {
   edgeMin: number;
   edgesInserted: number;
 };
+
+
+export type RunLite = {
+  id: number;
+  datasetId: string | null;
+  createdAt: string;
+  method: string;
+  minOverlap: number;
+  edgeMin: number;
+  edgeCount: number;
+};
+
+export type RunDetail = {
+  id: number;
+  datasetId: string | null;
+  createdAt: string;
+  method: string;
+  minOverlap: number;
+  edgeMin: number;
+  edges: { sourceId: string; targetId: string; sourceKey: string; targetKey: string; lag: number; weight: number }[];
+};

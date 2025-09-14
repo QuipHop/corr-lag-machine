@@ -135,7 +135,7 @@ export default function SeriesPanel() {
                       return exists ? { ...m, valueColumns: m.valueColumns.filter(v => v.name !== c.name) }
                         : { ...m, valueColumns: [...m.valueColumns, { name: c.name, key: c.name.toUpperCase() }] };
                     })}
-                    style={{ padding: '4px 8px', borderRadius: 8, border: '1px solid #ccc', background: inc ? '#eef' : '#fff' }}>
+                    style={{ color: 'black', padding: '4px 8px', borderRadius: 8, border: '1px solid #ccc', background: inc ? '#eef' : '#fff' }}>
                     {c.name}{inc ? ' ✓' : ''}
                   </button>
                 );
