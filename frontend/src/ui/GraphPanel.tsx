@@ -99,7 +99,7 @@ export default function GraphPanel() {
                     <button key={s.id} onClick={() => {
                       setSelected(prev => on ? prev.filter(k => k !== s.key) : [...prev, s.key]);
                     }}
-                      style={{ padding: '4px 8px', borderRadius: 8, border: '1px solid #ccc', background: on ? '#eef' : '#fff' }}>
+                      style={{ color: "black", padding: '4px 8px', borderRadius: 8, border: '1px solid #ccc', background: on ? '#eef' : '#fff' }}>
                       {s.key}{on ? ' ✓' : ''}
                     </button>
                   );

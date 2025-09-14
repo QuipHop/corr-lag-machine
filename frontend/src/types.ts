@@ -8,12 +8,21 @@ export type CreateDatasetResp = DatasetLite;
 
 export type UploadResp = { uploadId: string; columns: { name: string; typeGuess: 'date' | 'number'; examples: string[] }[]; sampleRows: number };
 export type PreviewReq = {
-  dateColumn: string;
-  valueColumns: { name: string; key: string; label?: string; units?: string }[];
   decimal: 'auto' | 'dot' | 'comma';
   dateFormat?: string;
   dropBlanks?: boolean;
+
+  // long
+  dateColumn?: string;
+  valueColumns?: ValueColReq[];
+
+  // wide
+  shape?: 'long' | 'wide';
+  seriesKeyColumn?: string;
+  monthColumns?: string[]; // optional
+  year?: number;           // optional
 };
+
 export type PreviewResp = {
   normalized: {
     freq: 'M';
@@ -72,3 +81,6 @@ export type RunDetail = {
   edgeMin: number;
   edges: { sourceId: string; targetId: string; sourceKey: string; targetKey: string; lag: number; weight: number }[];
 };
+
+export type ValueColReq = { name: string; key: string; label?: string; units?: string };
+

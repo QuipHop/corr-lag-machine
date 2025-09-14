@@ -113,6 +113,13 @@ function normalizeMonthly(
             // MM/YYYY
             const [mm, yy] = s.split('/');
             iso = `${yy}-${String(Number(mm)).padStart(2, '0')}-01`;
+
+        } else if (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(s)) {
+            // M/D/YY or M/D/YYYY  -> snap to first of month
+            const [mmRaw, ddRaw, yRaw] = s.split('/');
+            const yy = yRaw.length === 2 ? String(2000 + Number(yRaw)) : yRaw;
+            const mm = String(Number(mmRaw)).padStart(2, '0');
+            iso = `${yy}-${mm}-01`;
         } else {
             // MMM YYYY or MMM-YYYY (e.g., Jan 2024 or Jan-2024)
             const m = s.match(/^([A-Za-z]{3})[ -](\d{4})$/);
@@ -138,6 +145,36 @@ function normalizeMonthly(
         .sort((a, b) => a.date.localeCompare(b.date));
 
     return { rows: rowsNorm, warnings: warns };
+}
+
+const UA_MONTHS = ['січ', 'лют', 'бер', 'квіт', 'трав', 'черв', 'лип', 'серп', 'вер', 'жовт', 'лист', 'груд'];
+const EN_MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+
+function detectMonthFromHeader(h: string): { y?: number; m?: number } {
+    const s = (h ?? '').toString().toLowerCase().replace(/\u00a0/g, ' ').trim();
+    if (!s) return {};
+    // split bilingual like "Січень/January"
+    const parts = s.split(/[\/|]/).map(p => p.trim());
+    const tokens = parts.length > 1 ? parts : [s];
+
+    for (const t of tokens) {
+        for (let i = 0; i < 12; i++) {
+            if (t.startsWith(UA_MONTHS[i]) || t.startsWith(EN_MONTHS[i])) {
+                const y = (t.match(/\b(19|20)\d{2}\b/) || [])[0];
+                return { y: y ? Number(y) : undefined, m: i + 1 };
+            }
+        }
+        // numeric like "01 2024" or "1 2024"
+        const m = t.match(/\b(1[0-2]|0?[1-9])\b/);
+        const y = t.match(/\b(19|20)\d{2}\b/);
+        if (m) return { y: y ? Number(y[0]) : undefined, m: Number(m[0]) };
+    }
+    return {};
+}
+
+function slugifyKey(s: string) {
+    const base = s.trim().toUpperCase().replace(/[^\p{L}\p{N}]+/gu, '_').replace(/^_+|_+$/g, '');
+    return base.slice(0, 64) || 'SERIES';
 }
 
 
@@ -174,7 +211,6 @@ export class UploadsService {
     preview(uploadId: string, dto: PreviewDto) {
         const up = this.uploads.get(uploadId); if (!up) throw new NotFoundException('upload not found');
 
-        // Reuse stored meta to detect format again
         const pseudoFile = {
             buffer: up.file,
             originalname: up.meta.originalname,
@@ -183,14 +219,20 @@ export class UploadsService {
 
         const rows = parseToRows(pseudoFile);
 
-        const series = dto.valueColumns.map((vc) => {
-            const { rows: norm, warnings } = normalizeMonthly(rows, dto.dateColumn, (vc as any).name, dto as any);
-            return { key: (vc as any).key, label: (vc as any).label, units: (vc as any).units, rows: norm, rowCount: norm.length, warnings };
-        });
+        const res = dto.shape === 'wide'
+            ? this.previewWide(rows, dto)
+            : (() => {
+                const series = (dto.valueColumns ?? []).map((vc) => {
+                    const { rows: norm, warnings } = normalizeMonthly(rows, dto.dateColumn!, (vc as any).name, dto as any);
+                    return { key: (vc as any).key, label: (vc as any).label, units: (vc as any).units, rows: norm, rowCount: norm.length, warnings };
+                });
+                return { normalized: { freq: 'M', series }, warnings: series.flatMap((s: any) => s.warnings) };
+            })();
 
-        up.cached = { dto, series };
-        return { normalized: { freq: 'M', series }, warnings: series.flatMap((s: any) => s.warnings) };
+        up.cached = { dto, series: res.normalized.series };
+        return res;
     }
+
 
     async commit(uploadId: string, dto: CommitDto, idem?: string) {
         const up = this.uploads.get(uploadId); if (!up?.cached) throw new BadRequestException('preview first');
@@ -239,4 +281,58 @@ export class UploadsService {
             return { datasetId: ds.id, seriesCreated: created, pointsUpserted };
         });
     }
+
+    private previewWide(rows: Row[], dto: PreviewDto) {
+        const warns: string[] = [];
+        if (!rows.length) return { normalized: { freq: 'M', series: [] }, warnings: [] };
+        if (!dto.seriesKeyColumn) throw new BadRequestException('seriesKeyColumn required for wide mode');
+
+        // Which columns look like months?
+        const monthCols = (dto.monthColumns && dto.monthColumns.length)
+            ? dto.monthColumns
+            : Object.keys(rows[0]!).filter(h => !!detectMonthFromHeader(h).m);
+
+        if (!monthCols.length) throw new BadRequestException('No month-like columns detected');
+
+        const toNum = (s: string) => {
+            if (dto.decimal === 'comma' || (dto.decimal === 'auto' && (s ?? '').includes(',')))
+                s = s.replace(/\./g, '').replace(',', '.');
+            s = (s ?? '').toString().replace(/\s+/g, '').replace('%', '');
+            const v = Number(s);
+            return Number.isFinite(v) ? v : NaN;
+        };
+
+        const out: any[] = [];
+        for (const r of rows) {
+            const label = (r[dto.seriesKeyColumn] ?? '').toString().trim();
+            if (!label) continue;
+            const key = slugifyKey(label);
+
+            const pts: NormRow[] = [];
+            for (const col of monthCols) {
+                const cell = r[col];
+                if (cell === '' || cell === undefined || cell === null) continue;
+
+                const { y, m } = detectMonthFromHeader(col);
+                const year = y ?? dto.year;
+                if (!m || !year) { warns.push(`missing year for column "${col}"`); continue; }
+
+                const v = toNum(String(cell));
+                if (!Number.isFinite(v)) { warns.push(`non-numeric in "${col}": ${cell}`); continue; }
+
+                pts.push({ date: `${year}-${String(m).padStart(2, '0')}-01`, value: v });
+            }
+
+            if (pts.length) {
+                const map = new Map<string, number>();
+                for (const p of pts) map.set(p.date, p.value);
+                const rowsNorm = [...map.entries()].map(([date, value]) => ({ date, value }))
+                    .sort((a, b) => a.date.localeCompare(b.date));
+                out.push({ key, label, rows: rowsNorm, rowCount: rowsNorm.length, warnings: [] });
+            }
+        }
+
+        return { normalized: { freq: 'M', series: out }, warnings: warns };
+    }
+
 }
