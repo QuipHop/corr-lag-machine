@@ -14,14 +14,22 @@ import { MlController } from './ml.controller';
 import { IndicatorController } from './indicator.controller';
 import { SeriesListController } from './series.list.controller';
 import { AnalysisController } from './analysis.controller';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { APP_GUARD } from '@nestjs/core';
+import { MlModule } from '../ml/ml.module';
 
 @Module({
     imports: [
+        ThrottlerModule.forRoot([{
+            ttl: parseInt(process.env.RATE_LIMIT_TTL_SECONDS ?? '60', 10),
+            limit: parseInt(process.env.RATE_LIMIT_LIMIT ?? '60', 10),
+        }]),
         ConfigModule.forRoot({ isGlobal: true }),
         PrismaModule,
         DatasetsModule,
         UploadsModule,
-        CorellationModule, // <-- and here
+        CorellationModule,
+        MlModule
     ],
     controllers: [
         HealthController,
@@ -32,5 +40,8 @@ import { AnalysisController } from './analysis.controller';
         SeriesListController,
         AnalysisController,
     ],
+    providers: [
+        { provide: APP_GUARD, useClass: ThrottlerGuard }
+    ]
 })
 export class AppModule { }

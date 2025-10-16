@@ -1,14 +1,18 @@
-import { Module /*, Global*/ } from '@nestjs/common';
-import { PrismaModule } from '../shared/prisma.module';
+import { Module } from '@nestjs/common';
+import { HttpModule } from '@nestjs/axios';
 import { CorrelationController } from './correlation.controller';
 import { CorrelationService } from './correlation.service';
+import { AuditService } from '../audit/audit.service';
 
-// If you want it available app-wide without importing, uncomment @Global()
-// @Global()
 @Module({
-    imports: [PrismaModule],
+    imports: [
+        HttpModule.register({
+            timeout: 30000,
+            maxRedirects: 0,
+        }),
+    ],
     controllers: [CorrelationController],
-    providers: [CorrelationService],
-    exports: [CorrelationService],
+    providers: [CorrelationService, AuditService],
+    exports: [CorrelationService, AuditService],
 })
 export class CorellationModule { }

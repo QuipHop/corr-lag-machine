@@ -1,0 +1,30 @@
+{
+  "series": [
+    {
+      "id": 1, "code": "CPI",
+      "points": [
+        {"date":"2023-01-31","value":100},{"date":"2023-02-28","value":103},
+        {"date":"2023-03-31","value":101},{"date":"2023-04-30","value":106},
+        {"date":"2023-05-31","value":104},{"date":"2023-06-30","value":109},
+        {"date":"2023-07-31","value":108},{"date":"2023-08-31","value":112},
+        {"date":"2023-09-30","value":111},{"date":"2023-10-31","value":115}
+      ]
+    },
+    {
+      "id": 2, "code": "WAGE",
+      "points": [
+        {"date":"2023-03-31","value":100},{"date":"2023-04-30","value":103},
+        {"date":"2023-05-31","value":101},{"date":"2023-06-30","value":106},
+        {"date":"2023-07-31","value":104},{"date":"2023-08-31","value":109},
+        {"date":"2023-09-30","value":108},{"date":"2023-10-31","value":112}
+      ]
+    }
+  ],
+  "targetCode": "WAGE",
+  "candidateCodes": ["CPI"],
+  "method": "pearson",
+  "minOverlap": 6,
+  "lag": { "min": -4, "max": 4, "ignoreZero": false },
+  "resample": { "enabled": true, "downsample": "last", "upsample": "ffill", "winsorize_q": 0 },
+  "transform": "pct"
+}

@@ -1,0 +1,58 @@
+{
+    "series": [
+        {
+            "id": 1,
+            "code": "A",
+            "points": [
+                {
+                    "date": "2022-01-31",
+                    "value": 1
+                },
+                {
+                    "date": "2022-02-28",
+                    "value": 2
+                },
+                {
+                    "date": "2022-03-31",
+                    "value": 3
+                }
+            ]
+        },
+        {
+            "id": 2,
+            "code": "B",
+            "points": [
+                {
+                    "date": "2022-01-31",
+                    "value": 1
+                },
+                {
+                    "date": "2022-02-28",
+                    "value": 2
+                },
+                {
+                    "date": "2022-03-31",
+                    "value": 4
+                }
+            ]
+        }
+    ],
+    "targetCode": "A",
+    "method": "pearson",
+    "minOverlap": 3,
+    "resample": {
+        "enabled": true,
+        "freq": "M",
+        "downsample": "last",
+        "upsample": "ffill",
+        "winsorize_q": 0
+    },
+    "lag": {
+        "min": -1,
+        "max": 1,
+        "ignoreZero": false
+    },
+    "transform": "none",
+    "returnP": true,
+    "fdrAlpha": 0.1
+}

@@ -1,29 +1,41 @@
-import { useState } from 'react';
-import SeriesPanel from './ui/SeriesPanel';
-import SeriesBrowser from './ui/SeriesBrowser';
-import GraphPanel from './ui/GraphPanel';
-import CorrLagPanel from './ui/CorrLagPanel';
-import './App.css';
+import React from "react";
+import HeatmapPanel from "./ui/HeatmapPanel";
+import CorrLagPanel from "./ui/CorrLagPanel";
+import SarimaxPanel from "./ui/SarimaxPanel";
+import type { SeriesIn } from "./types";
 
-type Tab = 'upload' | 'browse' | 'graph' | 'lag';
-
+// Припустимо, що series вже приходять з SeriesBrowser/SeriesPanel
 export default function App() {
-  const [tab, setTab] = useState<Tab>('upload');
-  console.log("SSS");
+  const [series, setSeries] = React.useState<SeriesIn[]>([]);
+  const [targetCode, setTargetCode] = React.useState<string>("");
+  const [features, setFeatures] = React.useState<string[]>([]);
+  const [lags, setLags] = React.useState<Record<string, number>>({});
+
   return (
-    <div style={{ maxWidth: 1100, margin: '0 auto', padding: 12 }}>
-      <h2>Macro Correlations v1</h2>
-      <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
-        <button onClick={() => setTab('upload')} style={{ fontWeight: tab === 'upload' ? 700 : 400 }}>Upload</button>
-        <button onClick={() => setTab('browse')} style={{ fontWeight: tab === 'browse' ? 700 : 400 }}>Browse</button>
-        <button onClick={() => setTab('graph')} style={{ fontWeight: tab === 'graph' ? 700 : 400 }}>Graph</button>
-        <button onClick={() => setTab('lag')} style={{ fontWeight: tab === 'lag' ? 700 : 400 }}>Lag</button>
+    <div className="container mx-auto p-4 space-y-4">
+      {/* ...тут твій існуючий вибір серій/цілі ... */}
+
+      <div className="grid md:grid-cols-2 gap-4">
+        <div className="border rounded">
+          <div className="p-2 font-semibold">Heatmap</div>
+          <HeatmapPanel series={series} targetCode={targetCode} />
+        </div>
+
+        <div className="border rounded">
+          <div className="p-2 font-semibold">Corr Lag</div>
+          <CorrLagPanel series={series} />
+        </div>
       </div>
 
-      {tab === 'upload' && <SeriesPanel />}
-      {tab === 'browse' && <SeriesBrowser />}
-      {tab === 'graph' && <GraphPanel />}
-      {tab === 'lag' && <CorrLagPanel />}
+      <div className="border rounded">
+        <div className="p-2 font-semibold">SARIMAX</div>
+        <SarimaxPanel
+          series={series}
+          targetCode={targetCode}
+          selectedFeatures={features}
+          lags={lags}
+        />
+      </div>
     </div>
   );
 }

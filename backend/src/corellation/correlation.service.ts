@@ -1,75 +1,149 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
-import { PrismaService } from '../shared/prisma.service';
+import { HttpService } from '@nestjs/axios';
+import { Injectable, InternalServerErrorException, HttpException } from '@nestjs/common';
+import { lastValueFrom } from 'rxjs';
+import {
+    CorrHeatmapRequestDto,
+    CorrLagRequestDto,
+} from './dto/correlate.dto';
+import * as crypto from 'crypto';
 
-function applyTransform(arr: number[], type: string) {
-    switch (type) {
-        case 'pct_change': return arr.slice(1).map((v, i) => 100 * (v / arr[i] - 1));
-        case 'diff': return arr.slice(1).map((v, i) => v - arr[i]);
-        case 'log': if (arr.some(v => v <= 0)) throw new Error('log requires positive'); return arr.map(Math.log);
-        case 'zscore': {
-            const m = arr.reduce((a, b) => a + b, 0) / arr.length;
-            const sd = Math.sqrt(arr.reduce((s, v) => s + (v - m) ** 2, 0) / (arr.length - 1));
-            return arr.map(v => (v - m) / (sd || 1));
-        }
-        default: return arr;
-    }
-}
-const rank = (a: number[]) => {
-    const w = a.map((v, i) => ({ v, i })).sort((x, y) => x.v - y.v);
-    const r = Array(a.length).fill(0);
-    for (let i = 0; i < w.length; i++) { let j = i; while (j + 1 < w.length && w[j + 1].v === w[i].v) j++; const avg = (i + j + 2) / 2; for (let k = i; k <= j; k++) r[w[k].i] = avg; i = j; }
-    return r;
-};
-const pearson = (x: number[], y: number[]) => {
-    const n = x.length, mx = x.reduce((a, b) => a + b, 0) / n, my = y.reduce((a, b) => a + b, 0) / n;
-    let num = 0, sx = 0, sy = 0; for (let i = 0; i < n; i++) { const dx = x[i] - mx, dy = y[i] - my; num += dx * dy; sx += dx * dx; sy += dy * dy; }
-    return num / Math.sqrt((sx || 1) * (sy || 1));
-};
-const spearman = (x: number[], y: number[]) => pearson(rank(x), rank(y));
+type CacheEntry = { ts: number; data: any };
+type CacheMeta = { hit: boolean; age_s: number };
+type HttpMeta = { attempts: number; rt_ms: number };
 
 @Injectable()
 export class CorrelationService {
-    constructor(private prisma: PrismaService) { }
+    private readonly base = process.env.ML_SVC_URL || 'http://localhost:8000';
 
-    async run(dto: {
-        datasetId: string;
-        series: string[];
-        method?: 'spearman' | 'pearson';
-        transforms?: Record<string, { type: string }>;
-        pearsonAlso?: boolean;
-    }) {
-        const series = await this.prisma.series.findMany({
-            where: { datasetId: dto.datasetId, key: { in: dto.series } },
-            include: { observations: true },
-        });
-        if (series.length < 2) throw new BadRequestException('need >=2 series');
+    // in-memory LRU cache
+    private readonly cache = new Map<string, CacheEntry>();
+    private readonly TTL = parseInt(process.env.ML_CACHE_TTL_SECONDS || '600', 10); // 10 хв
+    private readonly MAX = parseInt(process.env.ML_CACHE_MAX_ENTRIES || '200', 10); // 200 ключів
 
-        const maps = series.map(s => new Map(
-            s.observations.map(o => [o.date.toISOString().slice(0, 10), Number(o.value)])
-        ));
-        const dates = [...maps[0].keys()].filter(d => maps.every(m => m.has(d))).sort();
-        if (dates.length < 6) throw new BadRequestException('too few overlapping points');
+    // ретраї
+    private readonly MAX_ATTEMPTS = parseInt(process.env.ML_HTTP_MAX_ATTEMPTS || '3', 10);
+    private readonly BACKOFF_MS = parseInt(process.env.ML_HTTP_BACKOFF_MS || '200', 10);
+    private readonly TIMEOUT_MS = parseInt(process.env.ML_HTTP_TIMEOUT_MS || '120000', 10);
 
-        let data = series.map((_, i) => dates.map(d => maps[i].get(d)!));
-        data = data.map((arr, i) => {
-            const key = series[i].key;
-            const t = dto.transforms?.[key]?.type ?? 'none';
-            return applyTransform(arr, t);
-        });
+    constructor(private readonly http: HttpService) { }
 
-        const n = Math.min(...data.map(a => a.length));
-        if (n < 6) throw new BadRequestException('too few points after transforms');
+    async health() {
+        try {
+            const { data } = await lastValueFrom(this.http.get(`${this.base}/health`));
+            return data;
+        } catch (e: any) {
+            throw this._wrapError(e);
+        }
+    }
 
-        const tail = (a: number[]) => a.slice(-n);
-        const out: any[] = [];
-        for (let i = 0; i < series.length; i++) {
-            for (let j = i + 1; j < series.length; j++) {
-                const xi = tail(data[i]), yj = tail(data[j]);
-                const rS = dto.method === 'pearson' ? null : spearman(xi, yj);
-                const rP = dto.pearsonAlso || dto.method === 'pearson' ? pearson(xi, yj) : null;
-                out.push({ x: series[i].key, y: series[j].key, n, spearman: rS, pearson: rP, overlapFrom: dates[dates.length - n], overlapTo: dates[dates.length - 1] });
+    async corrHeatmap(dto: CorrHeatmapRequestDto, refresh = false, requestId?: string) {
+        return this.cachedPost('/corr-heatmap', dto, refresh, requestId);
+    }
+    async corrLag(dto: CorrLagRequestDto, refresh = false, requestId?: string) {
+        return this.cachedPost('/corr-lag', dto, refresh, requestId);
+    }
+
+    private async cachedPost(
+        endpoint: string,
+        body: unknown,
+        refresh: boolean,
+        requestId?: string,
+    ): Promise<{ data: any; cacheMeta: CacheMeta; httpMeta: HttpMeta }> {
+        const key = this._makeKey(endpoint, body);           // <- ДОДАНО
+        const now = Date.now();
+
+        // HIT-перевірка
+        if (!refresh) {
+            const entry = this.cache.get(key);
+            if (entry && (now - entry.ts) / 1000 <= this.TTL) {
+                // LRU bump
+                this.cache.delete(key);
+                this.cache.set(key, entry);
+                return {
+                    data: entry.data,
+                    cacheMeta: { hit: true, age_s: (Date.now() - entry.ts) / 1000 },
+                    httpMeta: { attempts: 0, rt_ms: 0 },
+                };
             }
         }
-        return { freq: 'M', pairs: out };
+
+        // MISS / REFRESH — ретраї з бекофом
+        const started = Date.now();
+        let attempts = 0;
+        let lastError: any;
+
+        for (let attempt = 1; attempt <= this.MAX_ATTEMPTS; attempt++) {
+            attempts = attempt;
+            try {
+                const { data } = await lastValueFrom(
+                    this.http.post(
+                        `${this.base}${endpoint}`,
+                        body,
+                        {
+                            timeout: this.TIMEOUT_MS,
+                            headers: requestId ? { 'x-request-id': requestId } : undefined,
+                        },
+                    ),
+                );
+                const rt_ms = Date.now() - started;
+                this._lruSet(key, { ts: Date.now(), data });
+                return { data, cacheMeta: { hit: false, age_s: 0 }, httpMeta: { attempts, rt_ms } };
+            } catch (e: any) {
+                lastError = e;
+                if (!this._isRetryable(e) || attempt === this.MAX_ATTEMPTS) {
+                    throw this._wrapError(e);
+                }
+                const wait = this.BACKOFF_MS * Math.pow(2, attempt - 1);
+                await this._delay(wait);
+            }
+        }
+
+        throw this._wrapError(lastError);
     }
+
+    private _isRetryable(e: any): boolean {
+        const code = e?.code;
+        const status = e?.response?.status;
+        // мережеві помилки або серверні 5xx — ретраймо
+        if (code && ['ECONNABORTED', 'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes(code)) return true;
+        if (typeof status === 'number' && status >= 500 && status < 600) return true;
+        return false;
+    }
+
+    private _delay(ms: number) { return new Promise(res => setTimeout(res, ms)); }
+
+    private _errInfo(e: any) {
+        const status = e?.response?.status;
+        const msg = e?.message || 'error';
+        return status ? `${status} ${msg}` : msg;
+    }
+
+    private _wrapError(e: any) {
+        const status = e?.response?.status ?? 500;
+        const payload = e?.response?.data ?? { error: e?.message ?? 'ML service error' };
+        if (status >= 400 && status < 600) return new HttpException(payload, status);
+        return new InternalServerErrorException(payload);
+    }
+
+    private _lruSet(key: string, value: CacheEntry) {
+        if (this.cache.has(key)) this.cache.delete(key);
+        this.cache.set(key, value);
+        if (this.cache.size > this.MAX) {
+            const oldestKey = this.cache.keys().next().value as string;
+            this.cache.delete(oldestKey);
+        }
+    }
+
+    private _makeKey(endpoint: string, body: unknown): string {
+        const canon = stableStringify(body);
+        return crypto.createHash('sha256').update(endpoint + '|' + canon).digest('hex');
+    }
+}
+
+// ---------- утиліта стабільної серіалізації ----------
+function stableStringify(x: any): string {
+    if (x === null || typeof x !== 'object') return JSON.stringify(x);
+    if (Array.isArray(x)) return '[' + x.map(stableStringify).join(',') + ']';
+    const keys = Object.keys(x).sort();
+    return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(x[k])).join(',') + '}';
 }

@@ -1,0 +1,37 @@
+{
+  "series": [
+    {"id":1,"code":"WAGE","points":[
+      {"date":"2021-01-31","value":100},{"date":"2021-02-28","value":99},
+      {"date":"2021-03-31","value":101},{"date":"2021-04-30","value":102},
+      {"date":"2021-05-31","value":103},{"date":"2021-06-30","value":104},
+      {"date":"2021-07-31","value":105},{"date":"2021-08-31","value":106},
+      {"date":"2021-09-30","value":107},{"date":"2021-10-31","value":107},
+      {"date":"2021-11-30","value":108},{"date":"2021-12-31","value":110},
+      {"date":"2022-01-31","value":111},{"date":"2022-02-28","value":112},
+      {"date":"2022-03-31","value":114},{"date":"2022-04-30","value":115},
+      {"date":"2022-05-31","value":116},{"date":"2022-06-30","value":117},
+      {"date":"2022-07-31","value":118},{"date":"2022-08-31","value":119},
+      {"date":"2022-09-30","value":120},{"date":"2022-10-31","value":121},
+      {"date":"2022-11-30","value":122},{"date":"2022-12-31","value":123}
+    ]},
+    {"id":2,"code":"CPI","points":[
+      {"date":"2021-01-31","value":99},{"date":"2021-02-28","value":100},
+      {"date":"2021-03-31","value":101},{"date":"2021-04-30","value":101},
+      {"date":"2021-05-31","value":102},{"date":"2021-06-30","value":102},
+      {"date":"2021-07-31","value":103},{"date":"2021-08-31","value":103},
+      {"date":"2021-09-30","value":104},{"date":"2021-10-31","value":104},
+      {"date":"2021-11-30","value":105},{"date":"2021-12-31","value":105},
+      {"date":"2022-01-31","value":106},{"date":"2022-02-28","value":106},
+      {"date":"2022-03-31","value":107},{"date":"2022-04-30","value":107},
+      {"date":"2022-05-31","value":108},{"date":"2022-06-30","value":108},
+      {"date":"2022-07-31","value":109},{"date":"2022-08-31","value":109},
+      {"date":"2022-09-30","value":110},{"date":"2022-10-31","value":110},
+      {"date":"2022-11-30","value":111},{"date":"2022-12-31","value":111}
+    ]}
+  ],
+  "resample":{"enabled":true,"freq":"M","downsample":"last","upsample":"ffill","winsorize_q":0},
+  "transform":"none",
+  "features_cfg":{"targetCode":"WAGE","features":["CPI"],"lags":{"CPI":0}},
+  "train":{"auto_grid":{"p":[0,1],"d":[0,1],"q":[0,1],"P":[0,1],"D":[0,1],"Q":[0,1],"s":12,"max_models":12}},
+  "backtest":{"horizon":2,"min_train":12,"step":1,"expanding":true}
+}
