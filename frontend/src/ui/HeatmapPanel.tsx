@@ -1,6 +1,7 @@
 import React from "react";
 import { ML } from "../api/ml";
 import type { CorrHeatmapReq, SeriesIn, TransformMode, CorrMethod } from "../types";
+import HeatmapGrid from "./HeatmapGrid";
 
 type Props = {
     series: SeriesIn[];
@@ -102,9 +103,15 @@ export default function HeatmapPanel({ series, targetCode }: Props) {
                         </table>
                     </div>
 
-                    {/* Можна додати heatmap-плитку з resp.matrix, якщо потрібно */}
+                    {resp?.matrix?.length > 0 && (
+                        <div>
+                            <h3 className="font-semibold mb-1">Heatmap (lag columns)</h3>
+                            <HeatmapGrid rows={resp.matrix} />
+                        </div>
+                    )}
                 </div>
             )}
+
         </div>
     );
 }

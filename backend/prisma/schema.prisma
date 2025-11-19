@@ -137,3 +137,59 @@ model AnalysisAudit {
 
   @@index([createdAt, endpoint], map: "idx_audit_created_endpoint")
 }
+
+model Forecast {
+  id            String          @id @default(cuid())
+  datasetId     String
+  targetCode    String
+  featuresJson  Json // ["CPI","..."]
+  lagsJson      Json // {"CPI":0, ...}
+  transform     String // "none" | "diff1" | "pct"
+  seasonS       Int // 12 за замовчуванням
+  horizon       Int
+  order         String // "[p,d,q]"
+  seasonalOrder String // "[P,D,Q,s]"
+  aic           Float
+  metaJson      Json // таймінги тощо
+  createdAt     DateTime        @default(now())
+  points        ForecastPoint[]
+
+  @@index([datasetId, targetCode, createdAt])
+}
+
+model ForecastPoint {
+  id         String   @id @default(cuid())
+  forecastId String
+  date       DateTime
+  mean       Float
+  lo         Float?
+  hi         Float?
+
+  forecast Forecast @relation(fields: [forecastId], references: [id], onDelete: Cascade)
+
+  @@index([forecastId, date])
+}
+
+model AnalysisPreset {
+  id           String   @id @default(cuid())
+  datasetId    String
+  name         String
+  targetCode   String
+  featuresJson Json // ["CPI", ...]
+  lagsJson     Json // {"CPI":0}
+  transform    String // "none" | "diff1" | "pct"
+  seasonS      Int // 12
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([datasetId, targetCode, name])
+}
+
+model ModelRun {
+  id         Int      @id @default(autoincrement())
+  createdAt  DateTime @default(now())
+  name       String
+  type       String // SARIMAX_BACKTEST | SARIMAX_FORECAST | CORR_HEATMAP | ...
+  configJson Json
+  resultJson Json
+}

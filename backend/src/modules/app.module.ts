@@ -17,6 +17,7 @@ import { AnalysisController } from './analysis.controller';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { APP_GUARD } from '@nestjs/core';
 import { MlModule } from '../ml/ml.module';
+import { AnalysisModule } from '../analysis/analysis.module';
 
 @Module({
     imports: [
@@ -29,7 +30,8 @@ import { MlModule } from '../ml/ml.module';
         DatasetsModule,
         UploadsModule,
         CorellationModule,
-        MlModule
+        MlModule,
+        AnalysisModule
     ],
     controllers: [
         HealthController,

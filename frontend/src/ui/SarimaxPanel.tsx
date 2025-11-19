@@ -1,6 +1,7 @@
 import React from "react";
 import { ML } from "../api/ml";
 import type { SeriesIn, SarimaxBacktestReq, SarimaxForecastReq, TransformMode } from "../types";
+import { LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer, Area, AreaChart } from "recharts";
 
 type Props = { series: SeriesIn[]; targetCode: string; selectedFeatures: string[]; lags: Record<string, number>; };
 
@@ -80,19 +81,21 @@ export default function SarimaxPanel({ series, targetCode, selectedFeatures, lag
             {fc && (
                 <div className="border p-2 rounded">
                     <div className="font-semibold mb-2">Forecast (h={horizon})</div>
-                    <table className="min-w-full text-sm border">
-                        <thead><tr className="bg-gray-100"><th className="p-2 border">date</th><th className="p-2 border">mean</th><th className="p-2 border">lo</th><th className="p-2 border">hi</th></tr></thead>
-                        <tbody>
-                            {fc.forecast.map((r: any) => (
-                                <tr key={r.date}>
-                                    <td className="p-2 border">{r.date}</td>
-                                    <td className="p-2 border">{r.mean.toFixed(3)}</td>
-                                    <td className="p-2 border">{r.lo?.toFixed?.(3) ?? "-"}</td>
-                                    <td className="p-2 border">{r.hi?.toFixed?.(3) ?? "-"}</td>
-                                </tr>
-                            ))}
-                        </tbody>
-                    </table>
+
+                    <div className="h-64 w-full">
+                        <ResponsiveContainer>
+                            <AreaChart data={fc.forecast}>
+                                <CartesianGrid strokeDasharray="3 3" />
+                                <XAxis dataKey="date" />
+                                <YAxis />
+                                <Tooltip />
+                                {/* інтервал як напівпрозора стрічка */}
+                                <Area type="monotone" dataKey="hi" dot={false} activeDot={false} />
+                                <Area type="monotone" dataKey="lo" dot={false} activeDot={false} />
+                                <Line type="monotone" dataKey="mean" dot={false} />
+                            </AreaChart>
+                        </ResponsiveContainer>
+                    </div>
                     <div className="text-xs text-gray-500 mt-1">order={String(fc.order)} seasonal={String(fc.seasonal_order)} AIC={fc.aic.toFixed(2)}</div>
                 </div>
             )}

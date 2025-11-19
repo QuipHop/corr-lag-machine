@@ -1,3 +1,5 @@
+import { api } from "./client";
+
 const BASE = import.meta.env.VITE_API_BASE || 'http://localhost:3000';
 
 export type Point = { date: string; value: number };
@@ -141,3 +143,42 @@ export type CorrLagResponse = {
 export async function corrLag(body: CorrLagRequest, opts?: { refresh?: boolean; requestId?: string }) {
     return postJSON<CorrLagRequest, CorrLagResponse>('/analysis/corr-lag', body, opts);
 }
+
+export const ANALYSIS = {
+    // вже були corrHeatmapDb / sarimaxBacktestDb / sarimaxForecastDb — залишаємо
+
+    recommendFeatures: (body: {
+        datasetId: string;
+        targetCode: string;
+        candidateCodes?: string[];
+        method?: 'pearson' | 'spearman';
+        minOverlap?: number;
+        lag?: { min?: number; max?: number; ignoreZero?: boolean };
+        transform?: 'none' | 'diff1' | 'pct';
+        edgeMin?: number;
+        maxLagAbs?: number;
+        topK?: number;
+        fdrAlpha?: number;
+    }) => api<any, any>("/analysis/recommend-features", { method: "POST", body }),
+
+    forecastSave: (body: {
+        datasetId: string;
+        targetCode: string;
+        featureCodes?: string[];
+        lags?: Record<string, number>;
+        resample?: any;
+        transform?: 'none' | 'diff1' | 'pct';
+        train?: any;
+        horizon: number;
+        return_pi?: boolean;
+        alpha?: number;
+        name?: string;
+    }) => api<{ id: string; forecast: any[]; model: any; saved: boolean }, any>(
+        "/analysis/sarimax/forecast-db/save", { method: "POST", body }
+    ),
+
+    listForecasts: (datasetId: string, targetCode?: string, limit = 20) =>
+        api<any[]>(`/analysis/forecasts?datasetId=${encodeURIComponent(datasetId)}${targetCode ? `&targetCode=${encodeURIComponent(targetCode)}` : ''}&limit=${limit}`),
+
+    getForecast: (id: string) => api<any>(`/analysis/forecast/${encodeURIComponent(id)}`),
+};

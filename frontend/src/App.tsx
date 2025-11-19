@@ -4,7 +4,6 @@ import CorrLagPanel from "./ui/CorrLagPanel";
 import SarimaxPanel from "./ui/SarimaxPanel";
 import type { SeriesIn } from "./types";
 
-// Припустимо, що series вже приходять з SeriesBrowser/SeriesPanel
 export default function App() {
   const [series, setSeries] = React.useState<SeriesIn[]>([]);
   const [targetCode, setTargetCode] = React.useState<string>("");

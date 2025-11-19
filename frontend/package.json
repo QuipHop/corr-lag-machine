@@ -15,7 +15,7 @@
     "papaparse": "^5.5.3",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
-    "recharts": "^3.2.0",
+    "recharts": "^3.2.1",
     "vis-network": "^9.1.7"
   },
   "devDependencies": {
