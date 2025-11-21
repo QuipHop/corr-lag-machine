@@ -1,195 +1,71 @@
-generator client {
-  provider = "prisma-client-js"
-}
+// prisma/schema.prisma
 
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
-enum Frequency {
-  monthly
-  quarterly
-  annual
+generator client {
+  provider = "prisma-client-js"
 }
 
-model Dataset {
-  id          String    @id @default(cuid())
-  name        String
-  freq        Frequency @default(monthly)
-  mappingJson Json?
-  createdAt   DateTime  @default(now())
+model Experiment {
+  id         String    @id @default(uuid())
+  name       String
+  context    String? // наприклад "UA wage", "PL wage"
+  frequency  String // "M" / "Q" / "Y"
+  horizon    Int
+  createdAt  DateTime  @default(now())
+  finishedAt DateTime?
 
-  Series Series[]
-  runs   AnalysisRun[] // optional: back-rel to runs
+  // Повні JSON з ml-svc, щоб фронт міг показати пояснення
+  diagnostics  Json
+  correlations Json
+  factors      Json
+
+  // Зв'язки
+  models    Model[]
+  forecasts Forecast[]
+  metrics   ExperimentMetric[]
 }
 
-model Indicator {
-  id        Int      @id @default(autoincrement())
-  code      String   @unique
-  name      String
-  unit      String?
-  source    String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+model Model {
+  id           String     @id @default(uuid())
+  experimentId String
+  experiment   Experiment @relation(fields: [experimentId], references: [id])
 
-  Series Series[] // 1:N to Series
-}
-
-model Series {
-  id          String   @id @default(cuid())
-  datasetId   String
-  key         String
-  label       String?
-  units       String?
-  indicatorId Int?
-  createdAt   DateTime @default(now())
-
-  dataset      Dataset       @relation(fields: [datasetId], references: [id])
-  indicator    Indicator?    @relation(fields: [indicatorId], references: [id])
-  observations Observation[]
-
-  // back-relations for edges (must match names on AnalysisEdge)
-  outgoingEdges AnalysisEdge[] @relation("EdgeSource")
-  incomingEdges AnalysisEdge[] @relation("EdgeTarget")
-
-  @@unique([datasetId, key])
-}
-
-model Observation {
-  id        Int      @id @default(autoincrement())
-  seriesId  String
-  series    Series   @relation(fields: [seriesId], references: [id])
-  date      DateTime
-  value     Decimal  @db.Decimal(18, 4)
-  createdAt DateTime @default(now())
-
-  @@unique([seriesId, date])
-  @@index([seriesId, date])
-}
-
-model AnalysisRun {
-  id         Int      @id @default(autoincrement())
-  createdAt  DateTime @default(now())
-  method     String
-  maxLag     Int
-  minOverlap Int
-  edgeMin    Float
-  seriesIds  String
-
-  // link runs to the dataset they were computed for
-  datasetId String?
-  dataset   Dataset? @relation(fields: [datasetId], references: [id])
-
-  edges AnalysisEdge[]
-}
-
-model AnalysisEdge {
-  id Int @id @default(autoincrement())
-
-  runId Int
-  run   AnalysisRun @relation(fields: [runId], references: [id])
-
-  // source side
-  sourceId String
-  source   Series @relation("EdgeSource", fields: [sourceId], references: [id])
-
-  // target side
-  targetId String
-  target   Series @relation("EdgeTarget", fields: [targetId], references: [id])
-
-  lag    Int
-  weight Float
-
-  @@index([runId])
-  @@index([sourceId, targetId])
-}
-
-enum AnalysisEndpoint {
-  CORR_HEATMAP
-  CORR_LAG
-}
-
-enum TransformMode {
-  NONE
-  DIFF1
-  PCT
-}
-
-model AnalysisAudit {
-  id              String           @id @default(cuid())
-  createdAt       DateTime         @default(now())
-  requestId       String
-  endpoint        AnalysisEndpoint
-  sha             String
-  seriesCount     Int
-  pointsCount     Int
-  minOverlap      Int?
-  lagMin          Int
-  lagMax          Int
-  transform       TransformMode
-  cacheHit        Boolean
-  cacheAgeSeconds Float            @default(0)
-  httpAttempts    Int              @default(0)
-  httpRtMs        Int              @default(0)
-  status          Int
-  error           String?          @db.Text
-
-  @@index([createdAt, endpoint], map: "idx_audit_created_endpoint")
+  seriesName String
+  modelType  String
+  paramsJson Json
+  mase       Float?
+  smape      Float?
+  rmse       Float?
+  isSelected Boolean @default(false)
 }
 
 model Forecast {
-  id            String          @id @default(cuid())
-  datasetId     String
-  targetCode    String
-  featuresJson  Json // ["CPI","..."]
-  lagsJson      Json // {"CPI":0, ...}
-  transform     String // "none" | "diff1" | "pct"
-  seasonS       Int // 12 за замовчуванням
-  horizon       Int
-  order         String // "[p,d,q]"
-  seasonalOrder String // "[P,D,Q,s]"
-  aic           Float
-  metaJson      Json // таймінги тощо
-  createdAt     DateTime        @default(now())
-  points        ForecastPoint[]
+  id           String     @id @default(uuid())
+  experimentId String
+  experiment   Experiment @relation(fields: [experimentId], references: [id])
 
-  @@index([datasetId, targetCode, createdAt])
+  seriesName  String
+  date        DateTime
+  valueActual Float?
+  valuePred   Float?
+  lowerPi     Float?
+  upperPi     Float?
+  setType     String // "train" / "test" / "future"
 }
 
-model ForecastPoint {
-  id         String   @id @default(cuid())
-  forecastId String
-  date       DateTime
-  mean       Float
-  lo         Float?
-  hi         Float?
+model ExperimentMetric {
+  id           String     @id @default(uuid())
+  experimentId String
+  experiment   Experiment @relation(fields: [experimentId], references: [id])
 
-  forecast Forecast @relation(fields: [forecastId], references: [id], onDelete: Cascade)
-
-  @@index([forecastId, date])
-}
-
-model AnalysisPreset {
-  id           String   @id @default(cuid())
-  datasetId    String
-  name         String
-  targetCode   String
-  featuresJson Json // ["CPI", ...]
-  lagsJson     Json // {"CPI":0}
-  transform    String // "none" | "diff1" | "pct"
-  seasonS      Int // 12
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-
-  @@index([datasetId, targetCode, name])
-}
-
-model ModelRun {
-  id         Int      @id @default(autoincrement())
-  createdAt  DateTime @default(now())
-  name       String
-  type       String // SARIMAX_BACKTEST | SARIMAX_FORECAST | CORR_HEATMAP | ...
-  configJson Json
-  resultJson Json
+  seriesName String
+  modelType  String
+  horizon    Int
+  mase       Float
+  smape      Float
+  rmse       Float
 }
