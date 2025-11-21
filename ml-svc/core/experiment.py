@@ -1,7 +1,7 @@
 # ml-svc/core/experiment.py
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -114,13 +114,13 @@ def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 def run_full_experiment(req: ExperimentRequest) -> Dict:
     """
-    Реалізація повного алгоритму:
+    Повний алгоритм:
     1) формування DataFrame
     2) імпутація
     3) діагностика
     4) лагові кореляції target vs candidates
-    5) відбір драйверів (factors)
-    6) побудова SARIMAX для таргетів
+    5) відбір драйверів
+    6) SARIMAX для таргетів (train/test + фінальний future)
     7) формування прогнозів і метрик
     """
     # 1. DataFrame
@@ -155,7 +155,7 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
 
     diagnostics = Diagnostics(series=diag_items, frequency=req.frequency)
 
-    # 4. Лагові кореляції (тільки target vs candidates)
+    # 4. Лагові кореляції (target vs candidates)
     targets = [s.name for s in req.series if s.role == "target"]
     candidates = [s.name for s in req.series if s.role == "candidate"]
 
@@ -194,11 +194,10 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
 
     correlations = Correlations(pairs=corr_pairs, max_lag=max_lag)
 
-    # 5. Відбір драйверів: для кожного target беремо топ-3 candidate за |corr|
+    # 5. Драйвери: для кожного target беремо топ-3 candidate за |corr|
     factors_items: List[FactorInfo] = []
     for tgt in targets:
         relevant = [p for p in corr_pairs if p.target == tgt]
-        # max по модулю для кожного candidate
         by_cand: Dict[str, float] = {}
         for p in relevant:
             prev = by_cand.get(p.source)
@@ -210,7 +209,7 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
 
     factors = Factors(items=factors_items)
 
-    # 6. Моделювання: SARIMAX для кожного target з exog = drivers
+    # 6. Моделювання: SARIMAX для кожного target
     models: List[ModelInfo] = []
     metrics: List[MetricRow] = []
     forecast_points: List[ForecastPoint] = []
@@ -219,21 +218,22 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
     offset = _freq_to_offset(req.frequency)
 
     for tgt in targets:
-        y = df[tgt].astype(float)
+        y_full = df[tgt].astype(float)
         drivers = next((f.drivers for f in factors_items if f.target == tgt), [])
 
-        exog = df[drivers] if drivers else None
+        exog_full = df[drivers] if drivers else None
 
-        # train/test split
-        horizon = min(req.horizon, max(4, len(y) // 4))
-        train = y.iloc[:-horizon]
-        test = y.iloc[-horizon:]
-        exog_train = exog.iloc[:-horizon] if exog is not None else None
-        exog_test = exog.iloc[-horizon:] if exog is not None else None
+        # довжина тесту (hold-out для backtest)
+        horizon_test = min(req.horizon, max(4, len(y_full) // 4))
 
-        # SARIMAX(p,d,q)(P,D,Q)m – беремо просту схему (1,1,1) + сезонний (1,0,1)
+        train = y_full.iloc[:-horizon_test]
+        test = y_full.iloc[-horizon_test:]
+        exog_train = exog_full.iloc[:-horizon_test] if exog_full is not None else None
+        exog_test = exog_full.iloc[-horizon_test:] if exog_full is not None else None
+
+        # ---- 6.1. Перша модель: train -> in-sample + forecast на test ----
         try:
-            model = SARIMAX(
+            model1 = SARIMAX(
                 train,
                 order=(1, 1, 1),
                 seasonal_order=(1, 0, 1, m),
@@ -241,43 +241,35 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
                 enforce_stationarity=False,
                 enforce_invertibility=False,
             )
-            res = model.fit(disp=False)
+            res1 = model1.fit(disp=False)
         except Exception:
-            # fallback: без сезонності / без exog
-            model = SARIMAX(
+            model1 = SARIMAX(
                 train,
                 order=(1, 1, 1),
                 exog=exog_train,
                 enforce_stationarity=False,
                 enforce_invertibility=False,
             )
-            res = model.fit(disp=False)
+            res1 = model1.fit(disp=False)
 
-        # in-sample прогноз на train+test
-        pred_all = res.get_prediction(
-            start=train.index[0],
-            end=test.index[-1],
-            exog=exog if exog is not None else None,
-        )
-        pred_mean = pred_all.predicted_mean
-        pred_ci = pred_all.conf_int(alpha=0.2)  # 80% PI як приклад
+        # In-sample (train) – без exog у get_prediction, бо він знає їх з фіту
+        pred_train = res1.get_prediction()
+        pred_train_mean = pred_train.predicted_mean
+        pred_train_ci = pred_train.conf_int(alpha=0.2)
 
-        # майбутній прогноз
-        last_date = y.index[-1]
-        future_idx = pd.date_range(
-            last_date + pd.tseries.frequencies.to_offset(offset),
-            periods=req.horizon,
-            freq=offset,
-        )
-        exog_future = df[drivers].reindex(future_idx) if drivers else None
+        # Out-of-sample (test) – через get_forecast з exog_test
+        if exog_test is not None:
+            fc_test = res1.get_forecast(steps=horizon_test, exog=exog_test)
+        else:
+            fc_test = res1.get_forecast(steps=horizon_test)
 
-        fut_res = res.get_forecast(steps=req.horizon, exog=exog_future)
-        fut_mean = fut_res.predicted_mean
-        fut_ci = fut_res.conf_int(alpha=0.2)
+        test_mean = fc_test.predicted_mean
+        test_ci = fc_test.conf_int(alpha=0.2)
 
         # метрики на test
         y_test = test.values
-        y_pred_test = pred_mean.loc[test.index].values
+        y_pred_test = test_mean.values
+
         mase_val = _mase(y_test, y_pred_test, train.values, m=max(m, 1))
         smape_val = _smape(y_test, y_pred_test)
         rmse_val = _rmse(y_test, y_pred_test)
@@ -285,7 +277,7 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
         models.append(
             ModelInfo(
                 series_name=tgt,
-                model_type="SARIMAX(1,1,1)x(1,0,1)[{}]".format(m),
+                model_type=f"SARIMAX(1,1,1)x(1,0,1)[{m}]",
                 params={"drivers": drivers},
                 mase=mase_val,
                 smape=smape_val,
@@ -305,51 +297,108 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
             )
         )
 
-        # формуємо ForecastPoint для train/test
+        # ---- 6.2. Формуємо ForecastPoint для train/test ----
+
+        # train
         for idx_date in train.index:
+            mu = float(pred_train_mean.loc[idx_date])
+            ci_row = pred_train_ci.loc[idx_date]
+            lower = float(ci_row.iloc[0])
+            upper = float(ci_row.iloc[1])
             forecast_points.append(
                 ForecastPoint(
                     date=idx_date.date(),
                     series_name=tgt,
-                    value_actual=float(y.loc[idx_date]),
-                    value_pred=float(pred_mean.loc[idx_date]),
-                    lower_pi=float(pred_ci.loc[idx_date].iloc[0]),
-                    upper_pi=float(pred_ci.loc[idx_date].iloc[1]),
+                    value_actual=float(y_full.loc[idx_date]),
+                    value_pred=mu,
+                    lower_pi=lower,
+                    upper_pi=upper,
                     set_type="train",
                 )
             )
 
-        for idx_date in test.index:
+        # test – індекси беремо з test.index, значення з test_mean/test_ci по порядку
+        for i, idx_date in enumerate(test.index):
+            mu = float(test_mean.iloc[i])
+            ci_row = test_ci.iloc[i]
+            lower = float(ci_row.iloc[0])
+            upper = float(ci_row.iloc[1])
             forecast_points.append(
                 ForecastPoint(
                     date=idx_date.date(),
                     series_name=tgt,
-                    value_actual=float(y.loc[idx_date]),
-                    value_pred=float(pred_mean.loc[idx_date]),
-                    lower_pi=float(pred_ci.loc[idx_date].iloc[0]),
-                    upper_pi=float(pred_ci.loc[idx_date].iloc[1]),
+                    value_actual=float(y_full.loc[idx_date]),
+                    value_pred=mu,
+                    lower_pi=lower,
+                    upper_pi=upper,
                     set_type="test",
                 )
             )
 
-        # future
-        for idx_date in future_idx:
-            ci_row = fut_ci.loc[idx_date]
+        # ---- 6.3. Друга модель: full fit -> future forecast ----
+        try:
+            model2 = SARIMAX(
+                y_full,
+                order=(1, 1, 1),
+                seasonal_order=(1, 0, 1, m),
+                exog=exog_full,
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            )
+            res2 = model2.fit(disp=False)
+        except Exception:
+            model2 = SARIMAX(
+                y_full,
+                order=(1, 1, 1),
+                exog=exog_full,
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            )
+            res2 = model2.fit(disp=False)
+
+        # future index
+        last_date = y_full.index[-1]
+        future_idx = pd.date_range(
+            last_date + pd.tseries.frequencies.to_offset(offset),
+            periods=req.horizon,
+            freq=offset,
+        )
+
+        # exog_future: тримаємо останнє значення драйверів як константу
+        if exog_full is not None and len(exog_full.columns) > 0:
+            last_row = exog_full.iloc[-1]
+            exog_future = pd.DataFrame(
+                np.tile(last_row.values, (req.horizon, 1)),
+                index=future_idx,
+                columns=exog_full.columns,
+            )
+            fc_fut = res2.get_forecast(steps=req.horizon, exog=exog_future)
+        else:
+            fc_fut = res2.get_forecast(steps=req.horizon)
+
+        fut_mean = fc_fut.predicted_mean
+        fut_ci = fc_fut.conf_int(alpha=0.2)
+
+        for i, idx_date in enumerate(future_idx):
+            mu = float(fut_mean.iloc[i])
+            ci_row = fut_ci.iloc[i]
+            lower = float(ci_row.iloc[0])
+            upper = float(ci_row.iloc[1])
             forecast_points.append(
                 ForecastPoint(
                     date=idx_date.date(),
                     series_name=tgt,
                     value_actual=None,
-                    value_pred=float(fut_mean.loc[idx_date]),
-                    lower_pi=float(ci_row.iloc[0]),
-                    upper_pi=float(ci_row.iloc[1]),
+                    value_pred=mu,
+                    lower_pi=lower,
+                    upper_pi=upper,
                     set_type="future",
                 )
             )
 
     forecasts = Forecasts(base=forecast_points, macro=[])
 
-    # ---- Формуємо фінальну відповідь як dict, щоб to_native міг його пройти ----
+    # ---- Фінальна відповідь ----
 
     response = ExperimentResponse(
         diagnostics=diagnostics,
@@ -360,5 +409,5 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
         metrics=metrics,
     )
 
-    # Pydantic-модель -> dict, далі вже to_native + serialize у app.py
+    # Pydantic-модель -> dict, далі її вже to_native+serialize в app.py
     return response.model_dump()
