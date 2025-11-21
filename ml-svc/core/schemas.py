@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
-# ---------- Request ----------
+# --------- Вхідний payload від бекенду ---------
+
 
 class SeriesPayload(BaseModel):
     name: str
@@ -17,52 +18,53 @@ class SeriesPayload(BaseModel):
 
 class ExperimentRequest(BaseModel):
     experiment_id: str
-    dates: List[date]  # бек шле строки, pydantic сам конвертить у date
+    dates: List[str]
     series: List[SeriesPayload]
-
     frequency: Literal["M", "Q", "Y"]
-    horizon: int = Field(gt=0)
-
+    horizon: int
     imputation: Literal["none", "ffill", "bfill", "interp"] = "ffill"
     max_lag: int = 12
-
     extra: Dict[str, Any] = Field(default_factory=dict)
 
 
-# ---------- Diagnostics ----------
+# --------- Діагностика ---------
+
 
 class DiagnosticSeriesInfo(BaseModel):
     name: str
+    role: Literal["target", "candidate", "ignored"]
     n: int
-    mean: Optional[float]
-    std: Optional[float]
-    has_seasonality: Optional[bool] = None
+    mean: Optional[float] = None
+    std: Optional[float] = None
     adf_pvalue: Optional[float] = None
+    adf_stat: Optional[float] = None
     kpss_pvalue: Optional[float] = None
+    kpss_stat: Optional[float] = None
+    has_seasonality: Optional[bool] = None
+    season_label: Optional[str] = None
 
 
 class Diagnostics(BaseModel):
+    frequency: Literal["M", "Q", "Y"]
     series: List[DiagnosticSeriesInfo]
-    frequency: str
 
 
-# ---------- Correlations ----------
+# --------- Кореляції / фактори ---------
+
 
 class CorrelationEntry(BaseModel):
     source: str
     target: str
     lag: int
-    value: Optional[float]
-    abs: Optional[float]
+    value: Optional[float] = None
+    abs: Optional[float] = None
     n: int
 
 
 class Correlations(BaseModel):
-    pairs: List[CorrelationEntry]
     max_lag: int
+    pairs: List[CorrelationEntry]
 
-
-# ---------- Factors (drivers) ----------
 
 class FactorInfo(BaseModel):
     target: str
@@ -73,7 +75,8 @@ class Factors(BaseModel):
     items: List[FactorInfo]
 
 
-# ---------- Models / Forecasts / Metrics ----------
+# --------- Моделі / метрики ---------
+
 
 class ModelInfo(BaseModel):
     series_name: str
@@ -85,9 +88,21 @@ class ModelInfo(BaseModel):
     is_selected: bool = False
 
 
+class MetricRow(BaseModel):
+    series_name: str
+    model_type: str
+    horizon: int
+    mase: float
+    smape: float
+    rmse: float
+
+
+# --------- Прогнози ---------
+
+
 class ForecastPoint(BaseModel):
     date: date
-    series_name: Optional[str] = None  # для зручності, бек зараз це ігнорує
+    series_name: str
     value_actual: Optional[float] = None
     value_pred: Optional[float] = None
     lower_pi: Optional[float] = None
@@ -96,17 +111,11 @@ class ForecastPoint(BaseModel):
 
 
 class Forecasts(BaseModel):
-    base: List[ForecastPoint] = Field(default_factory=list)
+    base: List[ForecastPoint]
     macro: List[ForecastPoint] = Field(default_factory=list)
 
 
-class MetricRow(BaseModel):
-    series_name: str
-    model_type: str
-    horizon: int
-    mase: float
-    smape: float
-    rmse: float
+# --------- Повна відповідь експерименту ---------
 
 
 class ExperimentResponse(BaseModel):

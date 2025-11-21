@@ -5,8 +5,8 @@ from typing import Dict, List
 
 import numpy as np
 import pandas as pd
-from statsmodels.tsa.stattools import adfuller, kpss
 from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.stattools import adfuller, kpss
 
 from .schemas import (
     CorrelationEntry,
@@ -24,7 +24,7 @@ from .schemas import (
 )
 
 
-# --------- Допоміжні речі ---------
+# --------- Допоміжні функції ---------
 
 
 def _freq_to_offset(freq: str) -> str:
@@ -58,26 +58,26 @@ def _detect_seasonality(series: pd.Series, freq: str) -> bool:
     return bool(ac is not None and abs(ac) > 0.3)
 
 
-def _safe_adf(series: pd.Series) -> float | None:
+def _safe_adf_full(series: pd.Series):
     s = series.dropna()
     if len(s) < 10:
-        return None
+        return None, None
     try:
-        res = adfuller(s, autolag="AIC")
-        return float(res[1])
+        stat, pval, *_ = adfuller(s, autolag="AIC")
+        return float(stat), float(pval)
     except Exception:
-        return None
+        return None, None
 
 
-def _safe_kpss(series: pd.Series) -> float | None:
+def _safe_kpss_full(series: pd.Series):
     s = series.dropna()
     if len(s) < 10:
-        return None
+        return None, None
     try:
-        res = kpss(s, regression="c", nlags="auto")
-        return float(res[1])
+        stat, pval, *_ = kpss(s, regression="c", nlags="auto")
+        return float(stat), float(pval)
     except Exception:
-        return None
+        return None, None
 
 
 def _mase(y_true: np.ndarray, y_pred: np.ndarray, insample: np.ndarray, m: int) -> float:
@@ -115,13 +115,13 @@ def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 def run_full_experiment(req: ExperimentRequest) -> Dict:
     """
     Повний алгоритм:
-    1) формування DataFrame
+    1) формуємо DataFrame
     2) імпутація
     3) діагностика
     4) лагові кореляції target vs candidates
-    5) відбір драйверів
-    6) SARIMAX для таргетів (train/test + фінальний future)
-    7) формування прогнозів і метрик
+    5) вибір драйверів
+    6) SARIMAX для таргетів (train/test + future)
+    7) прогноз + метрики
     """
     # 1. DataFrame
     idx = pd.to_datetime(req.dates)
@@ -140,16 +140,26 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
 
     # 3. Діагностика
     diag_items: List[DiagnosticSeriesInfo] = []
+    role_by_name = {s.name: s.role for s in req.series}
+
     for name, s in df.items():
+        adf_stat, adf_p = _safe_adf_full(s)
+        kpss_stat, kpss_p = _safe_kpss_full(s)
+        has_season = _detect_seasonality(s, req.frequency)
+
         diag_items.append(
             DiagnosticSeriesInfo(
                 name=name,
+                role=role_by_name.get(name, "ignored"),
                 n=int(s.count()),
                 mean=float(s.mean()) if s.count() > 0 else None,
                 std=float(s.std()) if s.count() > 1 else None,
-                has_seasonality=_detect_seasonality(s, req.frequency),
-                adf_pvalue=_safe_adf(s),
-                kpss_pvalue=_safe_kpss(s),
+                adf_pvalue=adf_p,
+                adf_stat=adf_stat,
+                kpss_pvalue=kpss_p,
+                kpss_stat=kpss_stat,
+                has_seasonality=has_season,
+                season_label="yes" if has_season else "no",
             )
         )
 
@@ -194,7 +204,7 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
 
     correlations = Correlations(pairs=corr_pairs, max_lag=max_lag)
 
-    # 5. Драйвери: для кожного target беремо топ-3 candidate за |corr|
+    # 5. Вибір драйверів: топ-3 candidate за |corr| для кожного target
     factors_items: List[FactorInfo] = []
     for tgt in targets:
         relevant = [p for p in corr_pairs if p.target == tgt]
@@ -209,7 +219,7 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
 
     factors = Factors(items=factors_items)
 
-    # 6. Моделювання: SARIMAX для кожного target
+    # 6. Моделювання SARIMAX
     models: List[ModelInfo] = []
     metrics: List[MetricRow] = []
     forecast_points: List[ForecastPoint] = []
@@ -220,10 +230,9 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
     for tgt in targets:
         y_full = df[tgt].astype(float)
         drivers = next((f.drivers for f in factors_items if f.target == tgt), [])
-
         exog_full = df[drivers] if drivers else None
 
-        # довжина тесту (hold-out для backtest)
+        # довжина тестового відрізка
         horizon_test = min(req.horizon, max(4, len(y_full) // 4))
 
         train = y_full.iloc[:-horizon_test]
@@ -231,7 +240,7 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
         exog_train = exog_full.iloc[:-horizon_test] if exog_full is not None else None
         exog_test = exog_full.iloc[-horizon_test:] if exog_full is not None else None
 
-        # ---- 6.1. Перша модель: train -> in-sample + forecast на test ----
+        # 6.1. Модель 1: train -> backtest
         try:
             model1 = SARIMAX(
                 train,
@@ -252,12 +261,12 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
             )
             res1 = model1.fit(disp=False)
 
-        # In-sample (train) – без exog у get_prediction, бо він знає їх з фіту
+        # in-sample (train)
         pred_train = res1.get_prediction()
         pred_train_mean = pred_train.predicted_mean
         pred_train_ci = pred_train.conf_int(alpha=0.2)
 
-        # Out-of-sample (test) – через get_forecast з exog_test
+        # out-of-sample (test)
         if exog_test is not None:
             fc_test = res1.get_forecast(steps=horizon_test, exog=exog_test)
         else:
@@ -266,7 +275,7 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
         test_mean = fc_test.predicted_mean
         test_ci = fc_test.conf_int(alpha=0.2)
 
-        # метрики на test
+        # метрики
         y_test = test.values
         y_pred_test = test_mean.values
 
@@ -297,9 +306,7 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
             )
         )
 
-        # ---- 6.2. Формуємо ForecastPoint для train/test ----
-
-        # train
+        # 6.2. ForecastPoint: train
         for idx_date in train.index:
             mu = float(pred_train_mean.loc[idx_date])
             ci_row = pred_train_ci.loc[idx_date]
@@ -317,7 +324,7 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
                 )
             )
 
-        # test – індекси беремо з test.index, значення з test_mean/test_ci по порядку
+        # 6.2. ForecastPoint: test
         for i, idx_date in enumerate(test.index):
             mu = float(test_mean.iloc[i])
             ci_row = test_ci.iloc[i]
@@ -335,7 +342,7 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
                 )
             )
 
-        # ---- 6.3. Друга модель: full fit -> future forecast ----
+        # 6.3. Модель 2: full fit -> future
         try:
             model2 = SARIMAX(
                 y_full,
@@ -356,7 +363,6 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
             )
             res2 = model2.fit(disp=False)
 
-        # future index
         last_date = y_full.index[-1]
         future_idx = pd.date_range(
             last_date + pd.tseries.frequencies.to_offset(offset),
@@ -364,7 +370,6 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
             freq=offset,
         )
 
-        # exog_future: тримаємо останнє значення драйверів як константу
         if exog_full is not None and len(exog_full.columns) > 0:
             last_row = exog_full.iloc[-1]
             exog_future = pd.DataFrame(
@@ -398,8 +403,6 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
 
     forecasts = Forecasts(base=forecast_points, macro=[])
 
-    # ---- Фінальна відповідь ----
-
     response = ExperimentResponse(
         diagnostics=diagnostics,
         correlations=correlations,
@@ -409,5 +412,5 @@ def run_full_experiment(req: ExperimentRequest) -> Dict:
         metrics=metrics,
     )
 
-    # Pydantic-модель -> dict, далі її вже to_native+serialize в app.py
+    # FastAPI спокійно закодує dict у JSON
     return response.model_dump()
