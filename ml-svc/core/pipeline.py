@@ -515,6 +515,7 @@ def run_full_pipeline(req: ExperimentRequest) -> ExperimentResult:
         for date, actual, pred_val in zip(test.index, test.values, chosen_pred_test.values):
             base_forecast_points.append(
                 ForecastPoint(
+                    series_name=var,   # ← базова змінна
                     date=date.strftime("%Y-%m-%d"),
                     value_actual=float(actual),
                     value_pred=float(pred_val),
@@ -524,12 +525,14 @@ def run_full_pipeline(req: ExperimentRequest) -> ExperimentResult:
         for date, pred_val in zip(chosen_future.index, chosen_future.values):
             base_forecast_points.append(
                 ForecastPoint(
+                    series_name=var,   # ← та ж сама базова змінна
                     date=date.strftime("%Y-%m-%d"),
                     value_actual=None,
                     value_pred=float(pred_val),
                     set_type="future",
                 )
             )
+
 
     # 7. Прогноз макропоказників (таргетів) з урахуванням базових змінних
     macro_models: List[ModelInfo] = []
@@ -620,6 +623,7 @@ def run_full_pipeline(req: ExperimentRequest) -> ExperimentResult:
         for date, actual, pred_val in zip(test_y.index, test_y.values, chosen_pred_test.values):
             macro_forecast_points.append(
                 ForecastPoint(
+                    series_name=target,   # ← назва таргетного ряду
                     date=date.strftime("%Y-%m-%d"),
                     value_actual=float(actual),
                     value_pred=float(pred_val),
@@ -629,6 +633,7 @@ def run_full_pipeline(req: ExperimentRequest) -> ExperimentResult:
         for date, pred_val in zip(chosen_future.index, chosen_future.values):
             macro_forecast_points.append(
                 ForecastPoint(
+                    series_name=target,   # ← та сама ціль
                     date=date.strftime("%Y-%m-%d"),
                     value_actual=None,
                     value_pred=float(pred_val),

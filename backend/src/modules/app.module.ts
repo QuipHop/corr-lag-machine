@@ -18,6 +18,8 @@ import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { APP_GUARD } from '@nestjs/core';
 import { MlModule } from '../ml/ml.module';
 import { AnalysisModule } from '../analysis/analysis.module';
+import { ExperimentsModule } from '../experiments/experiments.module';
+import { ExperimentsController } from '../experiments/experiments.controller';
 
 @Module({
     imports: [
@@ -31,7 +33,8 @@ import { AnalysisModule } from '../analysis/analysis.module';
         UploadsModule,
         CorellationModule,
         MlModule,
-        AnalysisModule
+        AnalysisModule,
+        ExperimentsModule
     ],
     controllers: [
         HealthController,
@@ -41,6 +44,7 @@ import { AnalysisModule } from '../analysis/analysis.module';
         IndicatorController,
         SeriesListController,
         AnalysisController,
+        ExperimentsController
     ],
     providers: [
         { provide: APP_GUARD, useClass: ThrottlerGuard }

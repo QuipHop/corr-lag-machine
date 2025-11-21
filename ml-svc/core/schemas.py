@@ -53,6 +53,7 @@ class ForecastPoint(BaseModel):
     """
     Одна точка прогнозу / факту.
     """
+    series_name: str
     date: str
     value_actual: Optional[float] = None
     value_pred: Optional[float] = None
