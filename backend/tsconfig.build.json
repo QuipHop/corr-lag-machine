@@ -1,0 +1,17 @@
+{
+    "extends": "./tsconfig.json",
+    "exclude": [
+        "node_modules",
+        "dist",
+        "test",
+        "**/*.spec.ts",
+        "src/analysis/**/*",
+        "src/audit/**/*",
+        "src/datasets/**/*",
+        "src/modules/**/*",
+        "src/uploads/**/*",
+        "src/ml/**/*",
+        "src/correlation/**/*",
+        "src/corellation/**/*"
+    ]
+}

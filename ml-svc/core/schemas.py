@@ -1,60 +1,93 @@
 # ml-svc/core/schemas.py
 from __future__ import annotations
 
-from typing import List, Optional, Literal, Dict, Any
+from datetime import date
+from typing import Any, Dict, List, Literal, Optional
+
 from pydantic import BaseModel, Field
 
 
+# ---------- Request ----------
+
 class SeriesPayload(BaseModel):
-    """
-    Один часовий ряд: ім'я, роль і значення.
-    values йдуть у тому ж порядку, що й масив dates у запиті.
-    """
     name: str
-    role: Literal["target", "candidate", "ignored"] = "candidate"
-    values: List[Optional[float]] = Field(
-        ..., description="Time-ordered values aligned with dates[]"
-    )
+    role: Literal["target", "candidate", "ignored"]
+    values: List[Optional[float]]
 
 
 class ExperimentRequest(BaseModel):
-    """
-    Вхід у ml-svc: жодних файлів, тільки масив дат і рядів.
-    """
     experiment_id: str
-
-    dates: List[str]  # ISO-рядки 'YYYY-MM-DD'
+    dates: List[date]  # бек шле строки, pydantic сам конвертить у date
     series: List[SeriesPayload]
 
-    frequency: Literal["M", "Q", "Y"] = "M"   # місяць / квартал / рік
-    horizon: int = 12                        # довжина тестового періоду
+    frequency: Literal["M", "Q", "Y"]
+    horizon: int = Field(gt=0)
 
     imputation: Literal["none", "ffill", "bfill", "interp"] = "ffill"
-    max_lag: int = 12                        # макс. лаг для крос-кореляцій
+    max_lag: int = 12
 
-    extra: Dict[str, Any] = {}               # запас на майбутні налаштування
+    extra: Dict[str, Any] = Field(default_factory=dict)
 
+
+# ---------- Diagnostics ----------
+
+class DiagnosticSeriesInfo(BaseModel):
+    name: str
+    n: int
+    mean: Optional[float]
+    std: Optional[float]
+    has_seasonality: Optional[bool] = None
+    adf_pvalue: Optional[float] = None
+    kpss_pvalue: Optional[float] = None
+
+
+class Diagnostics(BaseModel):
+    series: List[DiagnosticSeriesInfo]
+    frequency: str
+
+
+# ---------- Correlations ----------
+
+class CorrelationEntry(BaseModel):
+    source: str
+    target: str
+    lag: int
+    value: Optional[float]
+    abs: Optional[float]
+    n: int
+
+
+class Correlations(BaseModel):
+    pairs: List[CorrelationEntry]
+    max_lag: int
+
+
+# ---------- Factors (drivers) ----------
+
+class FactorInfo(BaseModel):
+    target: str
+    drivers: List[str]
+
+
+class Factors(BaseModel):
+    items: List[FactorInfo]
+
+
+# ---------- Models / Forecasts / Metrics ----------
 
 class ModelInfo(BaseModel):
-    """
-    Інформація про МОДЕЛЬ (кандидат або обрана) для конкретного ряду.
-    is_selected = True для тієї, яка вважена найкращою за MASE.
-    """
     series_name: str
-    model_type: str              # "SARIMA", "SeasonalNaive", "SARIMAX" тощо
-    params: Dict[str, Any]
+    model_type: str
+    params: Dict[str, Any] = Field(default_factory=dict)
     mase: Optional[float] = None
     smape: Optional[float] = None
     rmse: Optional[float] = None
-    is_selected: bool = True
+    is_selected: bool = False
 
 
 class ForecastPoint(BaseModel):
-    """
-    Одна точка прогнозу / факту.
-    """
-    series_name: str
-    date: str
+    date: date
+    series_name: Optional[str] = None  # для зручності, бек зараз це ігнорує
     value_actual: Optional[float] = None
     value_pred: Optional[float] = None
     lower_pi: Optional[float] = None
@@ -62,10 +95,12 @@ class ForecastPoint(BaseModel):
     set_type: Literal["train", "test", "future"]
 
 
-class ExperimentMetric(BaseModel):
-    """
-    Агреговані метрики для таргетного ряду (обраної моделі).
-    """
+class Forecasts(BaseModel):
+    base: List[ForecastPoint] = Field(default_factory=list)
+    macro: List[ForecastPoint] = Field(default_factory=list)
+
+
+class MetricRow(BaseModel):
     series_name: str
     model_type: str
     horizon: int
@@ -74,18 +109,10 @@ class ExperimentMetric(BaseModel):
     rmse: float
 
 
-class ExperimentResult(BaseModel):
-    """
-    Повна відповідь пайплайна.
-    """
-    diagnostics: Dict[str, Any]              # стаціонарність, сезонність, базові змінні
-    correlations: Dict[str, Any]             # кореляції, крос-кореляції
-    factors: Dict[str, Any]                  # факторний аналіз, пояснена дисперсія
-    models: List[ModelInfo]                  # ВСІ моделі (кандидати + обрані)
-
-    # Прогнози:
-    #  - "base": базові змінні (test + future)
-    #  - "macro": таргетні макропоказники
-    forecasts: Dict[str, List[ForecastPoint]]
-
-    metrics: List[ExperimentMetric]          # MASE/sMAPE/RMSE для таргетів (обрані моделі)
+class ExperimentResponse(BaseModel):
+    diagnostics: Diagnostics
+    correlations: Correlations
+    factors: Factors
+    models: List[ModelInfo]
+    forecasts: Forecasts
+    metrics: List[MetricRow]

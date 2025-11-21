@@ -4,7 +4,7 @@
     "private": true,
     "scripts": {
         "dev": "ts-node-dev --transpile-only --respawn src/main.ts",
-        "build": "tsc -p tsconfig.json",
+        "build": "tsc -p tsconfig.build.json",
         "start": "node dist/main.js",
         "start:prod": "node dist/main.js",
         "prisma:generate": "prisma generate",
@@ -34,12 +34,16 @@
     },
     "devDependencies": {
         "@nestjs/cli": "^11.0.12",
+        "@nestjs/testing": "^11.1.9",
         "@types/express": "^5.0.3",
+        "@types/jest": "^30.0.0",
         "@types/multer": "^2.0.0",
         "@types/node": "^20.19.13",
         "@types/papaparse": "^5.3.16",
         "@types/xlsx": "^0.0.35",
+        "jest": "^30.2.0",
         "prisma": "^5.16.1",
+        "ts-jest": "^29.4.5",
         "ts-node-dev": "^2.0.0",
         "typescript": "^5.4.5"
     }
