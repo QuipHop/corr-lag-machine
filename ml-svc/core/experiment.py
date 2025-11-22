@@ -864,6 +864,7 @@ def _select_model_family_and_candidates(
 def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
     """
     Повна реалізація методу (8 кроків), узгоджена з текстом дисертації.
+    Тепер повертаємо тільки backtest (train/test), без future-прогнозів.
     """
 
     # 1. Приведення до єдиної періодичності (місячна)
@@ -932,7 +933,7 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
     forecast_base: List[ForecastPoint] = []
     forecast_macro: List[ForecastPoint] = []
 
-    # 5–6. Моделі для базових змінних (у вихідній шкалі)
+    # 5–6. Моделі для базових змінних (у вихідній шкалі), тільки backtest
     base_df = df_m[base_vars].copy() if base_vars else pd.DataFrame(index=df_m.index)
     allow_gbr = bool(req.extra.get("allow_gbr", True))
 
@@ -977,7 +978,22 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
                 )
             )
 
-        # прогнози базових (test + future)
+        # ПРОГНОЗИ БАЗОВИХ: тільки train + test
+        # train
+        for date, val_pred in zip(selected.dates_train, selected.y_pred_train):
+            actual = float(df_m.loc[date, name]) if date in df_m.index else None
+            forecast_base.append(
+                ForecastPoint(
+                    series_name=name,
+                    date=date.strftime("%Y-%m-%d"),
+                    value_actual=actual,
+                    value_pred=_safe_num(val_pred),
+                    lower_pi=None,
+                    upper_pi=None,
+                    set_type="train",
+                )
+            )
+        # test
         for date, val_pred in zip(selected.dates_test, selected.y_pred_test):
             actual = float(df_m.loc[date, name]) if date in df_m.index else None
             forecast_base.append(
@@ -992,20 +1008,7 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
                 )
             )
 
-        for date, val_pred in zip(selected.dates_future, selected.y_pred_future):
-            forecast_base.append(
-                ForecastPoint(
-                    series_name=name,
-                    date=date.strftime("%Y-%m-%d"),
-                    value_actual=None,
-                    value_pred=_safe_num(val_pred),
-                    lower_pi=None,
-                    upper_pi=None,
-                    set_type="future",
-                )
-            )
-
-    # 7. Прогноз таргетів із exog
+    # 7. Прогноз таргетів із exog (тільки backtest)
     for t_name in targets:
         y = df_m[t_name].astype("float64")
 
@@ -1032,7 +1035,7 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
 
         exog_df = pd.DataFrame(exog_cols).astype("float64") if exog_cols else None
 
-        # 🔧 важлива вставка: прибрати NaN/inf і вирівняти з датами y
+        # прибираємо NaN/inf і вирівнюємо з датами y
         if exog_df is not None:
             exog_df = exog_df.reindex(df_m.index)
             exog_df = exog_df.replace([np.inf, -np.inf], np.nan)
@@ -1042,7 +1045,8 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
 
         # кандидати: SeasonalNaive + SARIMAX
         cand_models: List[ModelCandidate] = []
-        cand_models.append(_fit_seasonal_naive(t_name, y, req.horizon, m=12))
+        naive_model = _fit_seasonal_naive(t_name, y, req.horizon, m=12)
+        cand_models.append(naive_model)
 
         sarimax_model = _fit_sarimax(
             name=t_name,
@@ -1060,6 +1064,7 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
         # пріоритет SARIMAX
         selected = sarimax_model or cand_models[0]
 
+        # моделі + метрики
         for m in cand_models:
             models.append(
                 ModelInfo(
@@ -1084,17 +1089,64 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
                 )
             )
 
-        # Ljung–Box для таргета
+        # оцінка ефективності vs бенчмарк (SeasonalNaive)
         if "targets" not in diagnostics:
             diagnostics["targets"] = {}
+
+        bench_mase = _safe_num(naive_model.mase)
+        sel_mase = _safe_num(selected.mase)
+        bench_smape = _safe_num(naive_model.smape)
+        sel_smape = _safe_num(selected.smape)
+        bench_rmse = _safe_num(naive_model.rmse)
+        sel_rmse = _safe_num(selected.rmse)
+
+        gain_smape_pct = None
+        if (
+            bench_smape is not None
+            and sel_smape is not None
+            and bench_smape != 0
+        ):
+            gain_smape_pct = _safe_num(
+                100.0 * (bench_smape - sel_smape) / bench_smape
+            )
+
         diagnostics["targets"][t_name] = {
             "lb_pvalue": _safe_num(selected.lb_pvalue),
             "residuals_ok": bool(
                 selected.lb_pvalue is not None and selected.lb_pvalue > 0.05
             ),
+            "benchmark": {
+                "model_type": naive_model.model_type,
+                "mase": bench_mase,
+                "smape": bench_smape,
+                "rmse": bench_rmse,
+            },
+            "selected": {
+                "model_type": selected.model_type,
+                "mase": sel_mase,
+                "smape": sel_smape,
+                "rmse": sel_rmse,
+            },
+            "gain_vs_benchmark": {
+                "smape_pct": gain_smape_pct,  # % зниження sMAPE
+            },
         }
 
-        # прогнози таргета (test + future)
+        # ПРОГНОЗИ ТАРГЕТА: тільки train + test
+        for date, val_pred in zip(selected.dates_train, selected.y_pred_train):
+            actual = float(df_m.loc[date, t_name]) if date in df_m.index else None
+            forecast_macro.append(
+                ForecastPoint(
+                    series_name=t_name,
+                    date=date.strftime("%Y-%m-%d"),
+                    value_actual=actual,
+                    value_pred=_safe_num(val_pred),
+                    lower_pi=None,
+                    upper_pi=None,
+                    set_type="train",
+                )
+            )
+
         for date, val_pred in zip(selected.dates_test, selected.y_pred_test):
             actual = float(df_m.loc[date, t_name]) if date in df_m.index else None
             forecast_macro.append(
@@ -1106,19 +1158,6 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
                     lower_pi=None,
                     upper_pi=None,
                     set_type="test",
-                )
-            )
-
-        for date, val_pred in zip(selected.dates_future, selected.y_pred_future):
-            forecast_macro.append(
-                ForecastPoint(
-                    series_name=t_name,
-                    date=date.strftime("%Y-%m-%d"),
-                    value_actual=None,
-                    value_pred=_safe_num(val_pred),
-                    lower_pi=None,
-                    upper_pi=None,
-                    set_type="future",
                 )
             )
 
