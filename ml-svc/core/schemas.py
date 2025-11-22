@@ -92,9 +92,9 @@ class MetricRow(BaseModel):
     series_name: str
     model_type: str
     horizon: int
-    mase: float
-    smape: float
-    rmse: float
+    mase: Optional[float] = None
+    smape: Optional[float] = None
+    rmse: Optional[float] = None
 
 
 # --------- Прогнози ---------

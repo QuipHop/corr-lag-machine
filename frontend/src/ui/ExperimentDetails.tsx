@@ -1,4 +1,3 @@
-// src/ui/ExperimentDetails.tsx
 import React, { useEffect, useMemo, useState } from "react";
 import {
   ExperimentDetails as ExperimentDetailsType,
@@ -54,7 +53,6 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
       if (!map[f.seriesName]) map[f.seriesName] = [];
       map[f.seriesName].push(f);
     }
-    // сортуємо за датою
     for (const key of Object.keys(map)) {
       map[key].sort(
         (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
@@ -83,10 +81,27 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
   const diag = experiment.diagnostics as any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const seriesDiag = (diag?.series || {}) as Record<string, any>;
-  const targets: string[] = diag?.targets ?? [];
+  // targets у diagnostics — це об’єкт { targetName: { lb_pvalue, residuals_ok } }
+  const targetsInfo: Record<string, any> = (diag?.targets || {}) as Record<
+    string,
+    any
+  >;
+  const targetNames: string[] = Object.keys(targetsInfo);
   const baseVars: string[] = diag?.base_variables ?? [];
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const correlations = (experiment.correlations || {}) as any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const factors = (experiment.factors || {}) as any;
+
   const selectedModels = experiment.models.filter((m) => m.isSelected);
+
+  // метрики без SeasonalNaive, тільки для таргетних рядів
+  const targetMetrics = experiment.metrics.filter(
+    (m) => m.modelType !== "SeasonalNaive" && targetNames.includes(m.seriesName)
+  );
+
+  const meta = diag?.meta;
 
   return (
     <div style={{ padding: "1rem" }}>
@@ -99,8 +114,8 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
         </div>
         <div>
           Період даних:{" "}
-          {diag?.meta
-            ? `${diag.meta.start} — ${diag.meta.end} (${diag.meta.n_rows} спостережень)`
+          {meta && meta.start && meta.end
+            ? `${meta.start} — ${meta.end} (${meta.n_rows} спостережень)`
             : "—"}
         </div>
       </div>
@@ -120,52 +135,68 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
               <th>KPSS p</th>
               <th>KPSS стац.</th>
               <th>Сезонність</th>
-              <th>Seasonal corr</th>
+              <th>ACF(12)</th>
+              <th>Трансформація</th>
+              <th>Нелінійність</th>
             </tr>
           </thead>
           <tbody>
             {Object.entries(seriesDiag).map(([name, info]) => {
+              const roleFromDiag = info.role as
+                | "target"
+                | "candidate"
+                | "ignored"
+                | "base"
+                | undefined;
+
               const role =
-                info.role ??
-                (targets.includes(name)
+                roleFromDiag ??
+                (targetNames.includes(name)
                   ? "target"
                   : baseVars.includes(name)
-                  ? "base"
-                  : "candidate");
+                    ? "base"
+                    : "candidate");
 
-              const adf = info.adf || {};
-              const kpss = info.kpss || {};
+              const adf_p: number | null =
+                typeof info.adf_p === "number" ? info.adf_p : null;
+              const kpss_p: number | null =
+                typeof info.kpss_p === "number" ? info.kpss_p : null;
+              const hasSeasonality = !!info.has_seasonality;
+              const acf12: number | null =
+                typeof info.acf_12 === "number" ? info.acf_12 : null;
 
               return (
                 <tr key={name}>
                   <td>{name}</td>
                   <td>{role}</td>
-                  <td>{info.mean?.toFixed?.(2) ?? ""}</td>
-                  <td>{info.std?.toFixed?.(2) ?? ""}</td>
-                  <td>{adf.pvalue != null ? adf.pvalue.toFixed(4) : ""}</td>
                   <td>
-                    {adf.is_stationary === true
-                      ? "так"
-                      : adf.is_stationary === false
-                      ? "ні"
-                      : ""}
-                  </td>
-                  <td>{kpss.pvalue != null ? kpss.pvalue.toFixed(4) : ""}</td>
-                  <td>
-                    {kpss.is_stationary === true
-                      ? "так"
-                      : kpss.is_stationary === false
-                      ? "ні"
+                    {typeof info.mean === "number"
+                      ? info.mean.toFixed(2)
                       : ""}
                   </td>
                   <td>
-                    {info.has_seasonality ? `s=${info.seasonal_period}` : "—"}
+                    {typeof info.std === "number" ? info.std.toFixed(2) : ""}
                   </td>
+                  <td>{adf_p != null ? adf_p.toFixed(4) : ""}</td>
                   <td>
-                    {info.seasonal_corr != null
-                      ? info.seasonal_corr.toFixed(3)
+                    {adf_p != null
+                      ? adf_p < 0.05
+                        ? "так"
+                        : "ні"
                       : ""}
                   </td>
+                  <td>{kpss_p != null ? kpss_p.toFixed(4) : ""}</td>
+                  <td>
+                    {kpss_p != null
+                      ? kpss_p > 0.05
+                        ? "так"
+                        : "ні"
+                      : ""}
+                  </td>
+                  <td>{hasSeasonality ? "є" : "нема"}</td>
+                  <td>{acf12 != null ? acf12.toFixed(3) : ""}</td>
+                  <td>{info.transform ?? ""}</td>
+                  <td>{info.is_nonlinear ? "так" : "ні"}</td>
                 </tr>
               );
             })}
@@ -173,9 +204,99 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
         </table>
       </section>
 
-      {/* 2. Вибір моделей */}
+      {/* 2. Кореляції та лаги (простий вивід) */}
       <section style={{ marginTop: "1.5rem" }}>
-        <h3>2. Вибір моделей (за MASE)</h3>
+        <h3>2. Кореляційний аналіз і лаги</h3>
+        <div style={{ fontSize: "0.9rem", marginBottom: "0.5rem" }}>
+          <strong>Базові змінні:</strong>{" "}
+          {baseVars.length ? baseVars.join(", ") : "не визначені"}
+        </div>
+
+        {/* Топ звʼязки для таргетів */}
+        {targetNames.map((t) => {
+          const edges = (correlations?.edges || []) as any[];
+          const rel = edges
+            .filter((e) => e.target === t)
+            .filter((e) => e.r_at_best_lag != null)
+            .sort(
+              (a, b) =>
+                Math.abs(b.r_at_best_lag) - Math.abs(a.r_at_best_lag)
+            )
+            .slice(0, 5);
+
+          if (!rel.length) return null;
+
+          return (
+            <div key={t} style={{ marginBottom: "0.75rem" }}>
+              <strong>{t}: найсильніші звʼязки</strong>
+              <table style={{ width: "100%", fontSize: "0.85rem" }}>
+                <thead>
+                  <tr>
+                    <th style={{ textAlign: "left" }}>Предиктор</th>
+                    <th>Lag</th>
+                    <th>r</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rel.map((e, idx) => (
+                    <tr key={idx}>
+                      <td>{e.source}</td>
+                      <td>{e.best_lag}</td>
+                      <td>
+                        {e.r_at_best_lag != null
+                          ? e.r_at_best_lag.toFixed(3)
+                          : ""}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          );
+        })}
+      </section>
+
+      {/* 3. Факторний аналіз / VIF */}
+      <section style={{ marginTop: "1.5rem" }}>
+        <h3>3. Базові змінні та факторний аналіз</h3>
+        <div style={{ fontSize: "0.9rem", marginBottom: "0.5rem" }}>
+          <strong>Обрані базові змінні:</strong>{" "}
+          {baseVars.length ? baseVars.join(", ") : "—"}
+        </div>
+
+        {/* VIF */}
+        {factors?.vif && (
+          <div style={{ marginBottom: "0.75rem" }}>
+            <strong>VIF (мультиколінеарність)</strong>
+            <table style={{ width: "100%", fontSize: "0.85rem" }}>
+              <thead>
+                <tr>
+                  <th style={{ textAlign: "left" }}>Змінна</th>
+                  <th>VIF</th>
+                </tr>
+              </thead>
+              <tbody>
+                {Object.entries(factors.vif).map(([name, v]: [string, any]) => (
+                  <tr key={name}>
+                    <td>{name}</td>
+                    <td>
+                      {typeof v === "number"
+                        ? v.toFixed(2)
+                        : v != null
+                          ? String(v)
+                          : ""}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      {/* 4. Вибір моделей */}
+      <section style={{ marginTop: "1.5rem" }}>
+        <h3>4. Вибір моделей (обрані за методом)</h3>
         <table style={{ width: "100%", fontSize: "0.9rem" }}>
           <thead>
             <tr>
@@ -191,18 +312,24 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
               <tr key={m.id}>
                 <td>{m.seriesName}</td>
                 <td>{m.modelType}</td>
-                <td>{m.mase != null ? m.mase.toFixed(3) : ""}</td>
-                <td>{m.smape != null ? m.smape.toFixed(1) + " %" : ""}</td>
-                <td>{m.rmse != null ? m.rmse.toFixed(3) : ""}</td>
+                <td>
+                  {m.mase != null ? m.mase.toFixed(3) : ""}
+                </td>
+                <td>
+                  {m.smape != null ? m.smape.toFixed(1) + " %" : ""}
+                </td>
+                <td>
+                  {m.rmse != null ? m.rmse.toFixed(3) : ""}
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
       </section>
 
-      {/* 3. Метрики по таргетах */}
+      {/* 5. Метрики прогнозу по таргетах */}
       <section style={{ marginTop: "1.5rem" }}>
-        <h3>3. Метрики прогнозу (таргетні ряди)</h3>
+        <h3>5. Метрики прогнозу (таргетні ряди)</h3>
         <table style={{ width: "100%", fontSize: "0.9rem" }}>
           <thead>
             <tr>
@@ -215,28 +342,34 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
             </tr>
           </thead>
           <tbody>
-            {experiment.metrics.map((m) => (
+            {targetMetrics.map((m) => (
               <tr key={m.id}>
                 <td>{m.seriesName}</td>
                 <td>{m.modelType}</td>
                 <td>{m.horizon}</td>
-                <td>{m.mase.toFixed(3)}</td>
-                <td>{m.smape.toFixed(1)} %</td>
-                <td>{m.rmse.toFixed(3)}</td>
+                <td>
+                  {m.mase != null ? m.mase.toFixed(3) : ""}
+                </td>
+                <td>
+                  {m.smape != null ? m.smape.toFixed(1) + " %" : ""}
+                </td>
+                <td>
+                  {m.rmse != null ? m.rmse.toFixed(3) : ""}
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
       </section>
 
-      {/* 4. Прогнози */}
+      {/* 6. Прогнози */}
       <section style={{ marginTop: "1.5rem" }}>
-        <h3>4. Прогнози</h3>
-        {targets.length === 0 && (
+        <h3>6. Прогнози</h3>
+        {targetNames.length === 0 && (
           <div>Таргетні ряди не визначені в diagnostics.</div>
         )}
 
-        {targets.map((seriesName) => {
+        {targetNames.map((seriesName) => {
           const seriesForecasts = forecastsBySeries[seriesName] || [];
           if (!seriesForecasts.length) return null;
 
@@ -264,7 +397,9 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                       <td>{f.date.slice(0, 10)}</td>
                       <td>{f.setType}</td>
                       <td>
-                        {f.valueActual != null ? f.valueActual.toFixed(3) : ""}
+                        {f.valueActual != null
+                          ? f.valueActual.toFixed(3)
+                          : ""}
                       </td>
                       <td>
                         {f.valuePred != null ? f.valuePred.toFixed(3) : ""}

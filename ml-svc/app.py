@@ -1,25 +1,22 @@
-# ml-svc/app.py
+# app.py
+
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-from core.schemas import ExperimentRequest
-from core.experiment import run_full_experiment
+from core.experiment import ExperimentRequest, ExperimentResult, run_full_experiment
 
-app = FastAPI(title="Corr Lag ML Service", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI()
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+class HealthResponse(BaseModel):
+    status: str
 
 
-@app.post("/experiment/run")
-def experiment_run(req: ExperimentRequest):
+@app.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
+    return HealthResponse(status="ok")
+
+
+@app.post("/experiment/run", response_model=ExperimentResult)
+def run_experiment(req: ExperimentRequest) -> ExperimentResult:
     return run_full_experiment(req)

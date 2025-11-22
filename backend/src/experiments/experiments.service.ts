@@ -40,7 +40,7 @@ type MlModel = {
 };
 
 type MlForecastPoint = {
-  series_name: string;              
+  series_name: string;
   date: string;
   value_actual: number | null;
   value_pred: number | null;
@@ -53,9 +53,9 @@ type MlMetric = {
   series_name: string;
   model_type: string;
   horizon: number;
-  mase: number;
-  smape: number;
-  rmse: number;
+  mase: number | null;
+  smape: number | null;
+  rmse: number | null;
 };
 
 type MlExperimentResult = {
@@ -80,7 +80,7 @@ export class ExperimentsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly http: HttpService,
-  ) {}
+  ) { }
 
   async runExperiment(dto: RunExperimentDto) {
     const { name, context, dates, series, frequency, horizon } = dto;
@@ -200,9 +200,9 @@ export class ExperimentsService {
             seriesName: m.series_name,
             modelType: m.model_type,
             horizon: m.horizon,
-            mase: m.mase,
-            smape: m.smape,
-            rmse: m.rmse,
+            mase: m.mase ?? 0,   // <- тут фіксимо
+            smape: m.smape ?? 0, // <- тут фіксимо
+            rmse: m.rmse ?? 0,   // <- тут фіксимо
           })),
         });
       }

@@ -217,3 +217,44 @@ export interface SarimaxForecastResp {
   forecast: { date: string; mean: number; lo?: number; hi?: number }[];
   meta: { timing_s: number };
 }
+export type MlForecastPoint = {
+  series_name: string;
+  date: string;
+  value_actual: number | null;
+  value_pred: number | null;
+  lower_pi: number | null;
+  upper_pi: number | null;
+  set_type: 'train' | 'test' | 'future';
+};
+
+export type MlModelInfo = {
+  series_name: string;
+  model_type: string;
+  params: Record<string, unknown>;
+  mase: number | null;
+  smape: number | null;
+  rmse: number | null;
+  is_selected: boolean;
+  reason?: string | null;
+};
+
+export type MlMetricRow = {
+  series_name: string;
+  model_type: string;
+  horizon: number;
+  mase: number | null;
+  smape: number | null;
+  rmse: number | null;
+};
+
+export type MlExperimentResult = {
+  diagnostics: any;
+  correlations: any;
+  factors: any;
+  models: MlModelInfo[];
+  forecasts: {
+    base: MlForecastPoint[];
+    macro: MlForecastPoint[];
+  };
+  metrics: MlMetricRow[];
+};
