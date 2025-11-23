@@ -60,96 +60,106 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
     return map;
   }, [forecasts]);
 
-  // діагностика / кореляції / фактори
   const diag = (experiment?.diagnostics || {}) as any;
   const seriesDiag = (diag?.series || {}) as Record<string, any>;
   const targetsInfo: Record<string, any> = (diag?.targets ||
     {}) as Record<string, any>;
+  const targetsExog: Record<string, any[]> = (diag?.targets_exog ||
+    {}) as Record<string, any[]>;
   const targetNames: string[] = Object.keys(targetsInfo);
   const baseVars: string[] = (diag?.base_variables || []) as string[];
+  const comparison = (diag?.comparison || {}) as any;
 
   const correlations = (experiment?.correlations || {}) as any;
   const factors = (experiment?.factors || {}) as any;
 
   const selectedModels = experiment?.models?.filter((m) => m.isSelected) ?? [];
-  const meta = diag?.meta;
-  const comparison = diag?.comparison || {};
 
-  // 1) ефективність комбінованого способу для таргетів:
-  //    беремо ТІЛЬКИ обрану модель для кожного таргета, без SeasonalNaive.
-  const efficiencyRows = useMemo(() => {
-    if (!experiment) return [];
-
-    return targetNames
-      .map((seriesName) => {
-        const selectedForTarget = selectedModels.find(
-          (m) => m.seriesName === seriesName
-        );
-        if (!selectedForTarget) return null;
-
-        const metric = experiment.metrics.find(
-          (mm) =>
-            mm.seriesName === seriesName &&
-            mm.modelType === selectedForTarget.modelType
-        );
-
-        const tDiag = targetsInfo[seriesName] || {};
-        const lbPvalue =
-          typeof tDiag.lb_pvalue === "number" ? tDiag.lb_pvalue : null;
-        const residualsOk =
-          typeof tDiag.residuals_ok === "boolean"
-            ? (tDiag.residuals_ok as boolean)
-            : null;
-
-        return {
-          seriesName,
-          modelType: selectedForTarget.modelType,
-          mase:
-            typeof metric?.mase === "number" && !Number.isNaN(metric.mase)
-              ? metric.mase
-              : null,
-          smape:
-            typeof metric?.smape === "number" && !Number.isNaN(metric.smape)
-              ? metric.smape
-              : null,
-          rmse:
-            typeof metric?.rmse === "number" && !Number.isNaN(metric.rmse)
-              ? metric.rmse
-              : null,
-          lbPvalue,
-          residualsOk,
-        };
-      })
-      .filter(Boolean) as Array<{
-        seriesName: string;
-        modelType: string;
-        mase: number | null;
-        smape: number | null;
-        rmse: number | null;
-        lbPvalue: number | null;
-        residualsOk: boolean | null;
-      }>;
-  }, [experiment, selectedModels, targetNames, targetsInfo]);
+  const selectedBySeries = useMemo(() => {
+    const map: Record<string, (typeof selectedModels)[number]> = {};
+    for (const m of selectedModels) {
+      map[m.seriesName] = m;
+    }
+    return map;
+  }, [selectedModels]);
 
   if (loading) {
-    return <div style={{ padding: "1rem" }}>Завантаження...</div>;
+    return (
+      <div
+        style={{
+          padding: "1rem",
+          backgroundColor: "#ffffff",
+          color: "#000000",
+        }}
+      >
+        Завантаження...
+      </div>
+    );
   }
 
   if (error) {
-    return <div style={{ padding: "1rem", color: "red" }}>{error}</div>;
+    return (
+      <div
+        style={{
+          padding: "1rem",
+          backgroundColor: "#ffffff",
+          color: "red",
+        }}
+      >
+        {error}
+      </div>
+    );
   }
 
   if (!experiment) {
     return (
-      <div style={{ padding: "1rem" }}>
+      <div
+        style={{
+          padding: "1rem",
+          backgroundColor: "#ffffff",
+          color: "#000000",
+        }}
+      >
         Обери експеримент, щоб побачити деталі.
       </div>
     );
   }
 
+  const meta = diag?.meta;
+
+  const containerStyle: React.CSSProperties = {
+    padding: "1rem",
+    backgroundColor: "#ffffff",
+    color: "#000000",
+    fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
+    fontSize: "14px",
+    lineHeight: 1.4,
+  };
+
+  const tableStyle: React.CSSProperties = {
+    width: "100%",
+    borderCollapse: "collapse",
+    fontSize: "0.9rem",
+  };
+
+  const thStyle: React.CSSProperties = {
+    borderBottom: "1px solid #000000",
+    textAlign: "left",
+    padding: "4px 6px",
+  };
+
+  const tdStyle: React.CSSProperties = {
+    borderBottom: "1px solid #dddddd",
+    padding: "4px 6px",
+  };
+
+  const sectionStyle: React.CSSProperties = { marginTop: "1.5rem" };
+
   return (
-    <div style={{ padding: "1rem" }}>
-      <h2>Експеримент: {experiment.name}</h2>
+    <div style={containerStyle}>
+      <h2 style={{ marginTop: 0 }}>
+        Експеримент: {experiment.name || experiment.id}
+      </h2>
       <div style={{ fontSize: "0.9rem", marginBottom: "0.5rem" }}>
         <div>ID: {experiment.id}</div>
         <div>Контекст: {experiment.context || <em>не вказано</em>}</div>
@@ -165,41 +175,35 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
       </div>
 
       {/* 1. Діагностика рядів */}
-      <section style={{ marginTop: "1rem" }}>
+      <section style={sectionStyle}>
         <h3>1. Діагностика рядів</h3>
-        <table style={{ width: "100%", fontSize: "0.9rem" }}>
+        <table style={tableStyle}>
           <thead>
             <tr>
-              <th style={{ textAlign: "left" }}>Ряд</th>
-              <th>Роль</th>
-              <th>Mean</th>
-              <th>Std</th>
-              <th>ADF p</th>
-              <th>ADF стац.</th>
-              <th>KPSS p</th>
-              <th>KPSS стац.</th>
-              <th>Сезонність</th>
-              <th>ACF(12)</th>
-              <th>Трансформація</th>
-              <th>Нелінійність</th>
+              <th style={thStyle}>Ряд</th>
+              <th style={thStyle}>Роль</th>
+              <th style={thStyle}>Mean</th>
+              <th style={thStyle}>Std</th>
+              <th style={thStyle}>ADF p</th>
+              <th style={thStyle}>ADF стац.</th>
+              <th style={thStyle}>KPSS p</th>
+              <th style={thStyle}>KPSS стац.</th>
+              <th style={thStyle}>Сезонність</th>
+              <th style={thStyle}>ACF(12)</th>
+              <th style={thStyle}>Трансформація</th>
+              <th style={thStyle}>Нелінійність</th>
             </tr>
           </thead>
           <tbody>
             {Object.entries(seriesDiag).map(([name, info]) => {
-              const roleFromDiag = info.role as
-                | "target"
-                | "candidate"
-                | "ignored"
-                | "base"
-                | undefined;
+              const isTarget = targetNames.includes(name);
+              const isBase = baseVars.includes(name);
 
-              const role =
-                roleFromDiag ??
-                (targetNames.includes(name)
-                  ? "target"
-                  : baseVars.includes(name)
-                    ? "base"
-                    : "candidate");
+              const roleLabel = isTarget
+                ? "цільовий ряд"
+                : isBase
+                  ? "базовий ряд"
+                  : "кандидат";
 
               const adf_p: number | null =
                 typeof info.adf_p === "number" ? info.adf_p : null;
@@ -211,32 +215,36 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
 
               return (
                 <tr key={name}>
-                  <td>{name}</td>
-                  <td>
-                    {role === "target"
-                      ? "цільовий ряд"
-                      : role === "base"
-                        ? "базовий ряд"
-                        : role}
-                  </td>
-                  <td>
+                  <td style={tdStyle}>{name}</td>
+                  <td style={tdStyle}>{roleLabel}</td>
+                  <td style={tdStyle}>
                     {typeof info.mean === "number"
                       ? info.mean.toFixed(2)
                       : ""}
                   </td>
-                  <td>
+                  <td style={tdStyle}>
                     {typeof info.std === "number" ? info.std.toFixed(2) : ""}
                   </td>
-                  <td>{adf_p != null ? adf_p.toFixed(4) : ""}</td>
-                  <td>{adf_p != null ? (adf_p < 0.05 ? "так" : "ні") : ""}</td>
-                  <td>{kpss_p != null ? kpss_p.toFixed(4) : ""}</td>
-                  <td>
+                  <td style={tdStyle}>
+                    {adf_p != null ? adf_p.toFixed(4) : ""}
+                  </td>
+                  <td style={tdStyle}>
+                    {adf_p != null ? (adf_p < 0.05 ? "так" : "ні") : ""}
+                  </td>
+                  <td style={tdStyle}>
+                    {kpss_p != null ? kpss_p.toFixed(4) : ""}
+                  </td>
+                  <td style={tdStyle}>
                     {kpss_p != null ? (kpss_p > 0.05 ? "так" : "ні") : ""}
                   </td>
-                  <td>{hasSeasonality ? "є" : "нема"}</td>
-                  <td>{acf12 != null ? acf12.toFixed(3) : ""}</td>
-                  <td>{info.transform ?? ""}</td>
-                  <td>{info.is_nonlinear ? "так" : "ні"}</td>
+                  <td style={tdStyle}>{hasSeasonality ? "є" : "нема"}</td>
+                  <td style={tdStyle}>
+                    {acf12 != null ? acf12.toFixed(3) : ""}
+                  </td>
+                  <td style={tdStyle}>{info.transform ?? ""}</td>
+                  <td style={tdStyle}>
+                    {info.is_nonlinear ? "так" : "ні"}
+                  </td>
                 </tr>
               );
             })}
@@ -244,8 +252,8 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
         </table>
       </section>
 
-      {/* 2. Кореляції та лаги */}
-      <section style={{ marginTop: "1.5rem" }}>
+      {/* 2. Кореляційний аналіз і лаги */}
+      <section style={sectionStyle}>
         <h3>2. Кореляційний аналіз і лаги</h3>
         <div style={{ fontSize: "0.9rem", marginBottom: "0.5rem" }}>
           <strong>Базові змінні:</strong>{" "}
@@ -268,20 +276,20 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
           return (
             <div key={t} style={{ marginBottom: "0.75rem" }}>
               <strong>{t}: найсильніші звʼязки</strong>
-              <table style={{ width: "100%", fontSize: "0.85rem" }}>
+              <table style={{ ...tableStyle, fontSize: "0.85rem" }}>
                 <thead>
                   <tr>
-                    <th style={{ textAlign: "left" }}>Предиктор</th>
-                    <th>Lag</th>
-                    <th>r</th>
+                    <th style={thStyle}>Предиктор</th>
+                    <th style={thStyle}>Lag</th>
+                    <th style={thStyle}>r</th>
                   </tr>
                 </thead>
                 <tbody>
                   {rel.map((e, idx) => (
                     <tr key={idx}>
-                      <td>{e.source}</td>
-                      <td>{e.best_lag}</td>
-                      <td>
+                      <td style={tdStyle}>{e.source}</td>
+                      <td style={tdStyle}>{e.best_lag}</td>
+                      <td style={tdStyle}>
                         {e.r_at_best_lag != null
                           ? e.r_at_best_lag.toFixed(3)
                           : ""}
@@ -295,8 +303,8 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
         })}
       </section>
 
-      {/* 3. Факторний аналіз / VIF */}
-      <section style={{ marginTop: "1.5rem" }}>
+      {/* 3. Базові змінні та факторний аналіз */}
+      <section style={sectionStyle}>
         <h3>3. Базові змінні та факторний аналіз</h3>
         <div style={{ fontSize: "0.9rem", marginBottom: "0.5rem" }}>
           <strong>Обрані базові змінні:</strong>{" "}
@@ -306,18 +314,18 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
         {factors?.vif && (
           <div style={{ marginBottom: "0.75rem" }}>
             <strong>VIF (мультиколінеарність)</strong>
-            <table style={{ width: "100%", fontSize: "0.85rem" }}>
+            <table style={{ ...tableStyle, fontSize: "0.85rem" }}>
               <thead>
                 <tr>
-                  <th style={{ textAlign: "left" }}>Змінна</th>
-                  <th>VIF</th>
+                  <th style={thStyle}>Змінна</th>
+                  <th style={thStyle}>VIF</th>
                 </tr>
               </thead>
               <tbody>
                 {Object.entries(factors.vif).map(([name, v]: [string, any]) => (
                   <tr key={name}>
-                    <td>{name}</td>
-                    <td>
+                    <td style={tdStyle}>{name}</td>
+                    <td style={tdStyle}>
                       {typeof v === "number"
                         ? v.toFixed(2)
                         : v != null
@@ -333,34 +341,43 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
       </section>
 
       {/* 4. Вибір моделей (обрані за методом) */}
-      <section style={{ marginTop: "1.5rem" }}>
+      <section style={sectionStyle}>
         <h3>4. Вибір моделей (обрані за методом)</h3>
-        <table style={{ width: "100%", fontSize: "0.9rem" }}>
+        <table style={tableStyle}>
           <thead>
             <tr>
-              <th style={{ textAlign: "left" }}>Ряд</th>
-              <th>Роль</th>
-              <th>Модель</th>
-              <th>MASE</th>
-              <th>sMAPE</th>
-              <th>RMSE</th>
+              <th style={thStyle}>Ряд</th>
+              <th style={thStyle}>Роль</th>
+              <th style={thStyle}>Модель</th>
+              <th style={thStyle}>MASE</th>
+              <th style={thStyle}>sMAPE</th>
+              <th style={thStyle}>RMSE</th>
             </tr>
           </thead>
           <tbody>
             {selectedModels.map((m) => {
-              const role = targetNames.includes(m.seriesName)
+              const isTarget = targetNames.includes(m.seriesName);
+              const isBase = baseVars.includes(m.seriesName);
+              const roleLabel = isTarget
                 ? "цільовий ряд"
-                : baseVars.includes(m.seriesName)
+                : isBase
                   ? "базовий ряд"
-                  : "";
+                  : "кандидат";
+
               return (
-                <tr key={m.id}>
-                  <td>{m.seriesName}</td>
-                  <td>{role}</td>
-                  <td>{m.modelType}</td>
-                  <td>{m.mase != null ? m.mase.toFixed(3) : ""}</td>
-                  <td>{m.smape != null ? m.smape.toFixed(1) + " %" : ""}</td>
-                  <td>{m.rmse != null ? m.rmse.toFixed(3) : ""}</td>
+                <tr key={`${m.seriesName}-${m.modelType}`}>
+                  <td style={tdStyle}>{m.seriesName}</td>
+                  <td style={tdStyle}>{roleLabel}</td>
+                  <td style={tdStyle}>{m.modelType}</td>
+                  <td style={tdStyle}>
+                    {m.mase != null ? m.mase.toFixed(3) : ""}
+                  </td>
+                  <td style={tdStyle}>
+                    {m.smape != null ? m.smape.toFixed(1) + " %" : ""}
+                  </td>
+                  <td style={tdStyle}>
+                    {m.rmse != null ? m.rmse.toFixed(3) : ""}
+                  </td>
                 </tr>
               );
             })}
@@ -368,102 +385,222 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
         </table>
       </section>
 
-      {/* 5. Оцінка ефективності комбінованого способу (тільки таргети, без SeasonalNaive в UI) */}
-      <section style={{ marginTop: "1.5rem" }}>
+      {/* 5. Оцінка ефективності комбінованого способу */}
+      <section style={sectionStyle}>
         <h3>5. Оцінка ефективності комбінованого способу (таргетні ряди)</h3>
-        {efficiencyRows.length === 0 ? (
+        {targetNames.length === 0 ? (
           <div style={{ fontSize: "0.9rem" }}>
-            Немає даних для таргетних рядів.
+            Таргетні ряди не визначені.
           </div>
         ) : (
-          <table style={{ width: "100%", fontSize: "0.8rem" }}>
+          <table style={{ ...tableStyle, fontSize: "0.85rem" }}>
             <thead>
               <tr>
-                <th style={{ textAlign: "left" }}>Ряд</th>
-                <th>Обрана модель</th>
-                <th>MASE</th>
-                <th>sMAPE</th>
-                <th>RMSE</th>
-                <th>p-value Ljung–Box</th>
-                <th>Залишки ок?</th>
+                <th style={thStyle}>Ряд</th>
+                <th style={thStyle}>Обрана модель</th>
+                <th style={thStyle}>MASE</th>
+                <th style={thStyle}>sMAPE</th>
+                <th style={thStyle}>RMSE</th>
+                <th style={thStyle}>p-value Ljung–Box</th>
+                <th style={thStyle}>Залишки ок?</th>
               </tr>
             </thead>
             <tbody>
-              {efficiencyRows.map((row) => (
-                <tr key={row.seriesName}>
-                  <td>{row.seriesName}</td>
-                  <td>{row.modelType}</td>
-                  <td>
-                    {row.mase != null ? row.mase.toFixed(3) : ""}
-                  </td>
-                  <td>
-                    {row.smape != null ? row.smape.toFixed(1) + " %" : ""}
-                  </td>
-                  <td>
-                    {row.rmse != null ? row.rmse.toFixed(3) : ""}
-                  </td>
-                  <td>
-                    {row.lbPvalue != null
-                      ? row.lbPvalue.toFixed(3)
-                      : ""}
-                  </td>
-                  <td>
-                    {row.residualsOk == null
-                      ? ""
-                      : row.residualsOk
-                        ? "так"
-                        : "ні"}
-                  </td>
-                </tr>
-              ))}
+              {targetNames.map((t) => {
+                const sel = selectedBySeries[t];
+                const tDiag = targetsInfo[t] || {};
+                const lb = tDiag.lb_pvalue;
+                const residOk = tDiag.residuals_ok;
+
+                if (!sel) return null;
+
+                return (
+                  <tr key={t}>
+                    <td style={tdStyle}>{t}</td>
+                    <td style={tdStyle}>{sel.modelType}</td>
+                    <td style={tdStyle}>
+                      {sel.mase != null ? sel.mase.toFixed(3) : ""}
+                    </td>
+                    <td style={tdStyle}>
+                      {sel.smape != null ? sel.smape.toFixed(1) + " %" : ""}
+                    </td>
+                    <td style={tdStyle}>
+                      {sel.rmse != null ? sel.rmse.toFixed(3) : ""}
+                    </td>
+                    <td style={tdStyle}>
+                      {typeof lb === "number" ? lb.toFixed(3) : ""}
+                    </td>
+                    <td style={tdStyle}>
+                      {typeof residOk === "boolean"
+                        ? residOk
+                          ? "так"
+                          : "ні"
+                        : ""}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}
+
+        {/* Пояснення, які базові змінні реально зайшли в exog */}
+        {targetNames.map((t) => {
+          const exogList = targetsExog[t] || [];
+          if (!exogList.length) return null;
+          return (
+            <div key={t} style={{ marginTop: "0.5rem", fontSize: "0.85rem" }}>
+              <strong>Для ряду {t} в комбінованому способі використано exogenous:</strong>{" "}
+              {exogList
+                .map((e) => {
+                  const base = e.base ?? e.base_name ?? "?";
+                  const lag = typeof e.lag === "number" ? e.lag : 0;
+                  return `${base}${lag > 0 ? ` (lag ${lag})` : ""}`;
+                })
+                .join(", ")}
+            </div>
+          );
+        })}
       </section>
 
-      {/* 6. Прогнози (тільки backtest) */}
-      <section style={{ marginTop: "1.5rem" }}>
-        <h3>6. Прогнози (backtest)</h3>
+      {/* 6. Прогнози (backtest + future) */}
+      <section style={sectionStyle}>
+        <h3>6. Прогнози</h3>
         {targetNames.length === 0 && (
           <div>Таргетні ряди не визначені в diagnostics.</div>
         )}
 
         {targetNames.map((seriesName) => {
+          // !!! CHANGE: Include future points
           const seriesForecasts = (forecastsBySeries[seriesName] || []).filter(
-            (f) => f.setType === "train" || f.setType === "test"
+            (f) => f.setType === "train" || f.setType === "test" || f.setType === "future"
           );
           if (!seriesForecasts.length) return null;
 
           return (
             <details key={seriesName} style={{ marginBottom: "1rem" }} open>
-              <summary>{seriesName} (train/test, без future)</summary>
+              <summary>{seriesName}</summary>
+
+              <div
+                style={{
+                  marginTop: "0.5rem",
+                  marginBottom: "0.5rem",
+                  border: "1px solid #000000",
+                  padding: "4px",
+                }}
+              >
+                <svg
+                  viewBox="0 0 400 200"
+                  preserveAspectRatio="none"
+                  style={{ width: "100%", height: "160px", background: "#ffffff" }}
+                >
+                  {(() => {
+                    const points = seriesForecasts;
+                    if (!points.length) return null;
+                    const xs = points.map((_, i) => i);
+                    const ysActual = points
+                      .map((p) => p.valueActual)
+                      .filter((v) => v != null) as number[];
+                    const ysPred = points
+                      .map((p) => p.valuePred)
+                      .filter((v) => v != null) as number[];
+
+                    if (!ysPred.length) return null; // Actual might be missing in future
+
+                    const allY = [...ysActual, ...ysPred];
+                    const yMin = Math.min(...allY);
+                    const yMax = Math.max(...allY);
+                    const padY = (yMax - yMin) * 0.05 || 1;
+                    const ymin = yMin - padY;
+                    const ymax = yMax + padY;
+                    const xMin = 0;
+                    const xMax = xs.length - 1;
+
+                    const scaleX = (i: number) =>
+                      xMax === xMin
+                        ? 0
+                        : ((i - xMin) / (xMax - xMin)) * 400;
+                    const scaleY = (v: number) =>
+                      ymax === ymin
+                        ? 100
+                        : 200 - ((v - ymin) / (ymax - ymin)) * 200;
+
+                    const line = (vals: (number | null | undefined)[]) => {
+                      const coords: string[] = [];
+                      vals.forEach((v, idx) => {
+                        if (v == null) return;
+                        const x = scaleX(idx);
+                        const y = scaleY(v);
+                        coords.push(`${x},${y}`);
+                      });
+                      return coords.join(" ");
+                    };
+
+                    // Split actual line
+                    const actualLine = line(
+                      points.map((p) => p.valueActual ?? null)
+                    );
+
+                    // Pred line (train/test/future)
+                    const predLine = line(
+                      points.map((p) => p.valuePred ?? null)
+                    );
+
+                    // Divider for future start
+                    const firstFutureIdx = points.findIndex(p => p.setType === 'future');
+                    const futureX = firstFutureIdx >= 0 ? scaleX(firstFutureIdx) : null;
+
+                    return (
+                      <>
+                        {futureX !== null && (
+                          <line x1={futureX} y1={0} x2={futureX} y2={200} stroke="#ff0000" strokeWidth={1} strokeDasharray="2 2" />
+                        )}
+                        <polyline
+                          points={actualLine}
+                          fill="none"
+                          stroke="#000000"
+                          strokeWidth={1.5}
+                        />
+                        <polyline
+                          points={predLine}
+                          fill="none"
+                          stroke="#2f855a"
+                          strokeWidth={1.5}
+                          strokeDasharray="4 1"
+                        />
+                      </>
+                    );
+                  })()}
+                </svg>
+              </div>
+
               <table
                 style={{
-                  width: "100%",
+                  ...tableStyle,
                   fontSize: "0.85rem",
                   marginTop: "0.5rem",
                 }}
               >
                 <thead>
                   <tr>
-                    <th style={{ textAlign: "left" }}>Дата</th>
-                    <th>Набір</th>
-                    <th>Факт</th>
-                    <th>Прогноз</th>
+                    <th style={thStyle}>Дата</th>
+                    <th style={thStyle}>Набір</th>
+                    <th style={thStyle}>Факт</th>
+                    <th style={thStyle}>Прогноз</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {seriesForecasts.map((f) => (
+                  {seriesForecasts.slice(-12).map((f) => ( // Show last 12 points
                     <tr key={`${f.seriesName}-${f.date}-${f.setType}`}>
-                      <td>{f.date.slice(0, 10)}</td>
-                      <td>{f.setType}</td>
-                      <td>
+                      <td style={tdStyle}>{f.date.slice(0, 10)}</td>
+                      <td style={tdStyle}>{f.setType}</td>
+                      <td style={tdStyle}>
                         {f.valueActual != null
                           ? f.valueActual.toFixed(3)
-                          : ""}
+                          : "—"}
                       </td>
-                      <td>
-                        {f.valuePred != null ? f.valuePred.toFixed(3) : ""}
+                      <td style={tdStyle}>
+                        {f.valuePred != null ? f.valuePred.toFixed(3) : "—"}
                       </td>
                     </tr>
                   ))}
@@ -475,11 +612,11 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
       </section>
 
       {/* 7. Порівняння моделей (горизонти 1–3 місяці) */}
-      <section style={{ marginTop: "1.5rem" }}>
+      <section style={sectionStyle}>
         <h3>7. Порівняння моделей (горизонти 1–3 місяці)</h3>
 
         {targetNames.map((t) => {
-          const cmp = (comparison && (comparison as any)[t]) || null;
+          const cmp = comparison ? (comparison as any)[t] : null;
           if (!cmp) return null;
 
           const horizons = Object.keys(cmp)
@@ -487,9 +624,18 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
             .sort((a, b) => a - b);
           if (!horizons.length) return null;
 
+          const selected = selectedBySeries[t];
+
           return (
             <div key={t} style={{ marginBottom: "1rem" }}>
               <h4>{t}</h4>
+
+              {selected && (
+                <div style={{ fontSize: "0.85rem", marginBottom: "0.25rem" }}>
+                  Наш метод (обрана модель для {t}):{" "}
+                  <strong>{selected.modelType}</strong>
+                </div>
+              )}
 
               {horizons.map((h) => {
                 const famRes = (cmp as any)[h];
@@ -501,24 +647,24 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                   <details
                     key={h}
                     style={{ marginBottom: "0.5rem" }}
-                    open={h === 3}
+                    open={h === 1}
                   >
                     <summary>Горизонт {h} місяць(і)</summary>
                     <table
                       style={{
-                        width: "100%",
+                        ...tableStyle,
                         fontSize: "0.85rem",
                         marginTop: "0.5rem",
                       }}
                     >
                       <thead>
                         <tr>
-                          <th style={{ textAlign: "left" }}>Модель</th>
-                          <th>MASE</th>
-                          <th>sMAPE</th>
-                          <th>RMSE</th>
-                          <th>t навчання, c</th>
-                          <th>t прогнозу, c</th>
+                          <th style={thStyle}>Модель</th>
+                          <th style={thStyle}>MASE</th>
+                          <th style={thStyle}>sMAPE</th>
+                          <th style={thStyle}>RMSE</th>
+                          <th style={thStyle}>t навчання, c</th>
+                          <th style={thStyle}>t прогнозу, c</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -543,18 +689,15 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                               ? r.pred_time.toFixed(3)
                               : "";
 
+                          let label = fam;
                           return (
                             <tr key={fam}>
-                              <td>
-                                {fam === "SARIMA"
-                                  ? "SARIMA (наш метод)"
-                                  : fam}
-                              </td>
-                              <td>{maseVal}</td>
-                              <td>{smapeVal}</td>
-                              <td>{rmseVal}</td>
-                              <td>{fitTimeVal}</td>
-                              <td>{predTimeVal}</td>
+                              <td style={tdStyle}>{label}</td>
+                              <td style={tdStyle}>{maseVal}</td>
+                              <td style={tdStyle}>{smapeVal}</td>
+                              <td style={tdStyle}>{rmseVal}</td>
+                              <td style={tdStyle}>{fitTimeVal}</td>
+                              <td style={tdStyle}>{predTimeVal}</td>
                             </tr>
                           );
                         })}

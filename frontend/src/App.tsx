@@ -42,7 +42,7 @@ const App: React.FC = () => {
   return (
     <div className="App" style={{ display: "flex", minHeight: "100vh" }}>
       <div style={{ flex: "0 0 420px", borderRight: "1px solid #ddd" }}>
-        <h1 style={{ padding: "0.5rem 1rem" }}>Corr Lag Machine</h1>
+        {/* <h1 style={{ padding: "0.5rem 1rem" }}>Prediction</h1> */}
         <ExperimentRunForm onExperimentCompleted={handleCompleted} />
 
         <div style={{ padding: "0.5rem 1rem" }}>
