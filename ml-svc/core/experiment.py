@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 import math
 import numpy as np
 import pandas as pd
+import time
+
 from pydantic import BaseModel, Field
 
 import statsmodels.api as sm
@@ -14,7 +16,7 @@ from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 from sklearn.decomposition import PCA
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 
 
 # =========================
@@ -90,6 +92,279 @@ class ExperimentResult(BaseModel):
 # =========================
 # Helpers: JSON-safe conversion
 # =========================
+def _make_lagged_ml(series: pd.Series, max_lag: int = 12) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Лагові ознаки для ML-моделей:
+    повертає (X, y), де X містить lag_1..lag_p.
+    """
+    s = pd.Series(series).copy()
+    df_lag = pd.DataFrame({"y": s})
+    for lag in range(1, max_lag + 1):
+        df_lag[f"lag_{lag}"] = df_lag["y"].shift(lag)
+    df_lag = df_lag.dropna()
+    if df_lag.empty:
+        return np.empty((0, max_lag)), np.empty((0,))
+    X = df_lag.drop(columns=["y"]).values
+    y = df_lag["y"].values
+    return X, y
+
+def _evaluate_target_horizons(
+    name: str,
+    y: pd.Series,
+    exog_df: Optional[pd.DataFrame],
+    max_lag: int,
+    allow_gbr: bool,
+    horizons: List[int],
+) -> Dict[str, Any]:
+    """
+    Colab-style порівняння моделей на горизонтах H=1,2,3.
+    Для кожного H:
+      - ARIMA
+      - SARIMA
+      - GB (Gradient Boosting)
+      - RF (Random Forest)
+      - SARIMAX (комбінований спосіб з exog)
+    Рахує MASE, sMAPE, RMSE, час навчання та прогнозу.
+    Повертає dict: {H: {family: {mase, smape, rmse, fit_time, pred_time}}}
+    """
+    series = y.dropna()
+    results: Dict[int, Any] = {}
+    if len(series) < 30:
+        return results
+
+    exog_aligned: Optional[pd.DataFrame] = None
+    if exog_df is not None:
+        exog_aligned = exog_df.reindex(series.index)
+
+    for H in horizons:
+        if H <= 0:
+            continue
+        # щоб було нормальне розділення train/test
+        if len(series) <= H + max_lag + 5:
+            continue
+
+        y_train_full = series.iloc[:-H]
+        y_test = series.iloc[-H:]
+        insample = y_train_full.values
+
+        if exog_aligned is not None:
+            ex_train = exog_aligned.iloc[:-H]
+            ex_future = exog_aligned.iloc[-H:]
+        else:
+            ex_train = None
+            ex_future = None
+
+        fam_res: Dict[str, Any] = {}
+
+        # === ARIMA ===
+        try:
+            start = time.perf_counter()
+            model_arima = sm.tsa.statespace.SARIMAX(
+                y_train_full,
+                order=(1, 1, 1),
+                seasonal_order=(0, 0, 0, 0),
+                exog=None,
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            ).fit(disp=False)
+            fit_t = time.perf_counter() - start
+
+            start = time.perf_counter()
+            fc = model_arima.get_forecast(steps=H)
+            pred = np.asarray(fc.predicted_mean, dtype="float64")
+            pred_t = time.perf_counter() - start
+
+            fam_res["ARIMA"] = {
+                "mase": mase_insample(insample, y_test.values, pred, m=1),
+                "smape": smape(y_test.values, pred),
+                "rmse": rmse(y_test.values, pred),
+                "fit_time": fit_t,
+                "pred_time": pred_t,
+            }
+        except Exception:
+            pass
+
+        # === SARIMA ===
+        try:
+            start = time.perf_counter()
+            model_sarima = sm.tsa.statespace.SARIMAX(
+                y_train_full,
+                order=(1, 1, 1),
+                seasonal_order=(0, 1, 1, 12),
+                exog=None,
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            ).fit(disp=False)
+            fit_t = time.perf_counter() - start
+
+            start = time.perf_counter()
+            fc = model_sarima.get_forecast(steps=H)
+            pred = np.asarray(fc.predicted_mean, dtype="float64")
+            pred_t = time.perf_counter() - start
+
+            fam_res["SARIMA"] = {
+                "mase": mase_insample(insample, y_test.values, pred, m=1),
+                "smape": smape(y_test.values, pred),
+                "rmse": rmse(y_test.values, pred),
+                "fit_time": fit_t,
+                "pred_time": pred_t,
+            }
+        except Exception:
+            pass
+
+        # === GB (Gradient Boosting) ===
+        if allow_gbr:
+            try:
+                X_ml, y_ml = _make_lagged_ml(y_train_full, max_lag=max_lag)
+                if y_ml.size >= 30:
+                    gb_model = GradientBoostingRegressor(
+                        random_state=42,
+                        n_estimators=300,
+                        learning_rate=0.05,
+                        max_depth=3,
+                    )
+                    start = time.perf_counter()
+                    gb_model.fit(X_ml, y_ml)
+                    fit_t = time.perf_counter() - start
+
+                    start = time.perf_counter()
+                    pred = _recursive_forecast_ml(
+                        gb_model, y_train_full, horizon=H, max_lag=max_lag
+                    )
+                    pred_t = time.perf_counter() - start
+
+                    fam_res["GB"] = {
+                        "mase": mase_insample(insample, y_test.values, pred, m=1),
+                        "smape": smape(y_test.values, pred),
+                        "rmse": rmse(y_test.values, pred),
+                        "fit_time": fit_t,
+                        "pred_time": pred_t,
+                    }
+            except Exception:
+                pass
+
+            # === RF (Random Forest) ===
+            try:
+                X_ml, y_ml = _make_lagged_ml(y_train_full, max_lag=max_lag)
+                if y_ml.size >= 30:
+                    rf_model = RandomForestRegressor(
+                        random_state=42,
+                        n_estimators=400,
+                        max_depth=None,
+                        n_jobs=-1,
+                    )
+                    start = time.perf_counter()
+                    rf_model.fit(X_ml, y_ml)
+                    fit_t = time.perf_counter() - start
+
+                    start = time.perf_counter()
+                    pred = _recursive_forecast_ml(
+                        rf_model, y_train_full, horizon=H, max_lag=max_lag
+                    )
+                    pred_t = time.perf_counter() - start
+
+                    fam_res["RF"] = {
+                        "mase": mase_insample(insample, y_test.values, pred, m=1),
+                        "smape": smape(y_test.values, pred),
+                        "rmse": rmse(y_test.values, pred),
+                        "fit_time": fit_t,
+                        "pred_time": pred_t,
+                    }
+            except Exception:
+                pass
+
+        # === SARIMAX (комбінований спосіб з exog) ===
+        if ex_train is not None and ex_future is not None:
+            try:
+                start = time.perf_counter()
+                model_sarimax = sm.tsa.statespace.SARIMAX(
+                    y_train_full,
+                    order=(1, 1, 1),
+                    seasonal_order=(0, 1, 1, 12),
+                    exog=ex_train,
+                    enforce_stationarity=False,
+                    enforce_invertibility=False,
+                ).fit(disp=False)
+                fit_t = time.perf_counter() - start
+
+                start = time.perf_counter()
+                fc = model_sarimax.get_forecast(steps=H, exog=ex_future)
+                pred = np.asarray(fc.predicted_mean, dtype="float64")
+                pred_t = time.perf_counter() - start
+
+                fam_res["SARIMAX"] = {
+                    "mase": mase_insample(insample, y_test.values, pred, m=1),
+                    "smape": smape(y_test.values, pred),
+                    "rmse": rmse(y_test.values, pred),
+                    "fit_time": fit_t,
+                    "pred_time": pred_t,
+                }
+            except Exception:
+                pass
+
+        if fam_res:
+            results[H] = fam_res
+
+    return results
+
+
+def _recursive_forecast_ml(
+    model,
+    history_series: pd.Series,
+    horizon: int,
+    max_lag: int = 12,
+) -> np.ndarray:
+    """
+    Рекурсивний багатокроковий прогноз для ML-моделей:
+    на кожному кроці беремо останні max_lag значень (з урахуванням уже спрогнозованих).
+    """
+    hist_vals = np.asarray(history_series, dtype="float64").copy()
+    preds: List[float] = []
+    if len(hist_vals) < max_lag:
+        raise ValueError("Not enough history for given max_lag")
+
+    for _ in range(horizon):
+        lags = [hist_vals[-lag] for lag in range(1, max_lag + 1)]
+        X_new = np.array(lags).reshape(1, -1)
+        y_hat = float(model.predict(X_new)[0])
+        preds.append(y_hat)
+        hist_vals = np.append(hist_vals, y_hat)
+
+    return np.asarray(preds, dtype="float64")
+
+def mase_insample(
+    y_train: np.ndarray,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    m: int = 1,
+) -> float:
+    """
+    MASE зі шкалою, порахованою на in-sample (train):
+    - y_train — повний тренувальний ряд;
+    - y_true / y_pred — значення на тесті.
+    """
+    y_train = np.asarray(y_train, dtype="float64")
+    y_true = np.asarray(y_true, dtype="float64")
+    y_pred = np.asarray(y_pred, dtype="float64")
+
+    # чисельник: MAE на тесті
+    mask = ~np.isnan(y_true) & ~np.isnan(y_pred)
+    y_true = y_true[mask]
+    y_pred = y_pred[mask]
+    if y_true.size == 0:
+        return float("nan")
+    num = np.mean(np.abs(y_true - y_pred))
+
+    # знаменник: середня абсолютна зміна на train з лагом m
+    ins = y_train[~np.isnan(y_train)]
+    if ins.size <= m:
+        return float("nan")
+
+    denom = np.mean(np.abs(ins[m:] - ins[:-m]))
+    if not math.isfinite(denom) or denom == 0.0:
+        return float("nan")
+
+    return float(num / denom)
 
 def _make_stationary_series(
     y: pd.Series,
@@ -543,6 +818,8 @@ class ModelCandidate:
     mase: float
     smape: float
     rmse: float
+    fit_time: float
+    pred_time: float
     params: Dict[str, Any]
     y_pred_train: np.ndarray
     y_pred_test: np.ndarray
@@ -551,6 +828,7 @@ class ModelCandidate:
     dates_test: pd.DatetimeIndex
     dates_future: pd.DatetimeIndex
     lb_pvalue: Optional[float] = None  # тільки для ARIMA-подібних
+
 
 
 def _train_val_split(
@@ -562,6 +840,94 @@ def _train_val_split(
         return y.iloc[:split], y.iloc[split:]
     return y.iloc[:-horizon], y.iloc[-horizon:]
 
+def _fit_rf_regressor(
+    name: str,
+    y: pd.Series,
+    horizon: int,
+    max_lag: int,
+) -> Optional[ModelCandidate]:
+    """
+    Random Forest із лагами цільового ряду:
+    X_t = [y_{t-1},...,y_{t-p}], p = min(max_lag, 12).
+    Використовується як baseline-модель.
+    """
+    p = min(max_lag, 12)
+    df = pd.DataFrame({"y": y})
+    for lag in range(1, p + 1):
+        df[f"lag_{lag}"] = df["y"].shift(lag)
+    df = df.dropna()
+
+    if len(df) < 30:
+        return None
+
+    y_all = df["y"]
+    X_all = df.drop(columns=["y"])
+
+    y_train, y_test = _train_val_split(y_all, horizon)
+    split_idx = len(y_train)
+    X_train = X_all.iloc[:split_idx]
+    X_test = X_all.iloc[split_idx:]
+
+    model = RandomForestRegressor(
+        random_state=42,
+        n_estimators=400,
+        max_depth=None,
+        n_jobs=-1,
+    )
+
+    # Час навчання
+    start_fit = time.perf_counter()
+    model.fit(X_train.values, y_train.values)
+    fit_time = time.perf_counter() - start_fit
+
+    # Час прогнозу (test + future)
+    start_pred = time.perf_counter()
+    pred_test = model.predict(X_test.values)
+
+    # autorecursive прогноз у майбутнє
+    last_vals = list(y.values[-p:])
+    future: List[float] = []
+    for _ in range(horizon):
+        features = np.array(last_vals[-p:][::-1])  # [y_{t-1},...,y_{t-p}]
+        pred = float(model.predict(features.reshape(1, -1))[0])
+        future.append(pred)
+        last_vals.append(pred)
+    future_arr = np.array(future, dtype="float64")
+
+    pred_time = time.perf_counter() - start_pred
+
+    err_mase = mase_insample(y_train.values, y_test.values, pred_test, m=12)
+    err_smape = smape(y_test.values, pred_test)
+    err_rmse = rmse(y_test.values, pred_test)
+
+    idx_all = y_all.index
+    dates_train = idx_all[:split_idx]
+    dates_test = idx_all[split_idx:]
+
+    last_date = y.index[-1]
+    future_index = pd.date_range(
+        start=last_date + pd.offsets.MonthBegin(1),
+        periods=horizon,
+        freq="MS",
+    )
+
+    return ModelCandidate(
+        series_name=name,
+        model_type="RF",
+        reason="baseline: Random Forest з лагами цільового ряду",
+        mase=err_mase,
+        smape=err_smape,
+        rmse=err_rmse,
+        fit_time=fit_time,
+        pred_time=pred_time,
+        params={"lags": p},
+        y_pred_train=model.predict(X_train.values),
+        y_pred_test=pred_test,
+        y_pred_future=future_arr,
+        dates_train=dates_train,
+        dates_test=dates_test,
+        dates_future=future_index,
+    )
 
 def _fit_seasonal_naive(
     name: str,
@@ -571,7 +937,7 @@ def _fit_seasonal_naive(
 ) -> ModelCandidate:
     """
     Бенчмарк-модель (сезонний наївний прогноз).
-    Не обирається як основна згідно з методом — лише для порівняння.
+    НЕ входить до комбінованого методу, використовується тільки для порівняння.
     """
     train, test = _train_val_split(y, horizon)
     y_train = train.values
@@ -586,13 +952,13 @@ def _fit_seasonal_naive(
     else:
         pred_test = np.repeat(y_train[-1], len(test))
 
-    # майбутнє (просте повторення сезонного шаблону)
+    # майбутнє (для повноти, зараз у backtest не використовуємо)
     future_vals = pred_test[-m:].tolist()
     while len(future_vals) < horizon:
         future_vals.extend(future_vals[-m:])
     future = np.array(future_vals[:horizon])
 
-    err_mase = mase(y_test, pred_test, m=m)
+    err_mase = mase_insample(train.values, y_test, pred_test, m=m)
     err_smape = smape(y_test, pred_test)
     err_rmse = rmse(y_test, pred_test)
 
@@ -610,6 +976,8 @@ def _fit_seasonal_naive(
         mase=err_mase,
         smape=err_smape,
         rmse=err_rmse,
+        fit_time=0.0,
+        pred_time=0.0,
         params={"m": m},
         y_pred_train=np.full(len(train), np.nan),
         y_pred_test=pred_test,
@@ -617,6 +985,7 @@ def _fit_seasonal_naive(
         dates_train=train.index,
         dates_test=test.index,
         dates_future=future_index,
+        lb_pvalue=None,
     )
 
 
@@ -632,7 +1001,7 @@ def _fit_sarimax(
     if exog is not None:
         ex_train = exog.loc[train.index]
         ex_test = exog.loc[test.index]
-        # для майбутнього беремо останні значення (спрощено)
+        # для майбутнього – беремо останні horizon значень exog (для реального forecast)
         ex_future = exog.iloc[-horizon:]
         if len(ex_future) < horizon:
             ex_future = None
@@ -641,15 +1010,16 @@ def _fit_sarimax(
 
     order = (1, 1, 1)
     seasonal_order = (0, 0, 0, 0)
-    reason = "linear ARIMA"
+    reason = "ARIMA (лінійна динаміка)"
 
     if has_seasonality:
         seasonal_order = (1, 0, 1, 12)
-        reason = "seasonal SARIMA"
+        reason = "SARIMA (регулярна сезонність)"
         if exog is not None:
-            reason = "SARIMAX with exogenous regressors"
+            reason = "SARIMAX з екзогенними змінними"
 
     try:
+        start_fit = time.perf_counter()
         model = sm.tsa.statespace.SARIMAX(
             train,
             order=order,
@@ -659,14 +1029,16 @@ def _fit_sarimax(
             enforce_invertibility=False,
         )
         res = model.fit(disp=False)
+        fit_time = time.perf_counter() - start_fit
     except Exception:
         return None
 
-    # backtest
+    # backtest (прогноз на тестовий відрізок)
+    start_pred = time.perf_counter()
     pred_test = res.get_forecast(steps=len(test), exog=ex_test)
     mean_test = pred_test.predicted_mean
 
-    # майбутнє
+    # майбутнє (не відображаємо у backtest, але залишаємо в структурі)
     last_date = y.index[-1]
     future_index = pd.date_range(
         start=last_date + pd.offsets.MonthBegin(1),
@@ -678,8 +1050,9 @@ def _fit_sarimax(
     else:
         pred_future = res.get_forecast(steps=horizon)
     mean_future = pred_future.predicted_mean
+    pred_time = time.perf_counter() - start_pred
 
-    err_mase = mase(test.values, mean_test.values, m=12)
+    err_mase = mase_insample(train.values, test.values, mean_test.values, m=12)
     err_smape = smape(test.values, mean_test.values)
     err_rmse = rmse(test.values, mean_test.values)
 
@@ -691,13 +1064,21 @@ def _fit_sarimax(
     except Exception:
         lb_p = None
 
+    model_type = (
+        "SARIMAX" if exog is not None
+        else "SARIMA" if has_seasonality
+        else "ARIMA"
+    )
+
     return ModelCandidate(
         series_name=name,
-        model_type="SARIMAX" if exog is not None else "SARIMA" if has_seasonality else "ARIMA",
+        model_type=model_type,
         reason=reason,
         mase=err_mase,
         smape=err_smape,
         rmse=err_rmse,
+        fit_time=fit_time,
+        pred_time=pred_time,
         params={
             "order": order,
             "seasonal_order": seasonal_order,
@@ -711,7 +1092,6 @@ def _fit_sarimax(
         lb_pvalue=lb_p,
     )
 
-
 def _fit_gb_regressor(
     name: str,
     y: pd.Series,
@@ -719,8 +1099,9 @@ def _fit_gb_regressor(
     max_lag: int,
 ) -> Optional[ModelCandidate]:
     """
-    Простий нелінійний GradientBoosting:
+    GradientBoosting з лагами:
     X_t = [y_{t-1},...,y_{t-p}], p = min(max_lag, 12).
+    Використовується тільки за вираженої нелінійності (is_nonlinear=True).
     """
     p = min(max_lag, 12)
     df = pd.DataFrame({"y": y})
@@ -740,22 +1121,26 @@ def _fit_gb_regressor(
     X_test = X_all.iloc[split_idx:]
 
     model = GradientBoostingRegressor(random_state=42)
-    model.fit(X_train.values, y_train.values)
 
+    start_fit = time.perf_counter()
+    model.fit(X_train.values, y_train.values)
+    fit_time = time.perf_counter() - start_fit
+
+    start_pred = time.perf_counter()
     pred_test = model.predict(X_test.values)
 
     # прогноз у майбутнє (autorecursive)
     last_vals = list(y.values[-p:])
     future = []
     for _ in range(horizon):
-        # виправлена лінія:
         features = np.array(last_vals[-p:][::-1])  # [y_{t-1},...,y_{t-p}]
         pred = model.predict(features.reshape(1, -1))[0]
         future.append(pred)
         last_vals.append(pred)
     future = np.array(future)
+    pred_time = time.perf_counter() - start_pred
 
-    err_mase = mase(y_test.values, pred_test, m=12)
+    err_mase = mase_insample(y_train.values, y_test.values, pred_test, m=12)
     err_smape = smape(y_test.values, pred_test)
     err_rmse = rmse(y_test.values, pred_test)
 
@@ -773,10 +1158,12 @@ def _fit_gb_regressor(
     return ModelCandidate(
         series_name=name,
         model_type="GBR",
-        reason="nonlinear GradientBoosting (за наявності нелінійності)",
+        reason="GradientBoosting (нелінійна модель з лагами)",
         mase=err_mase,
         smape=err_smape,
         rmse=err_rmse,
+        fit_time=fit_time,
+        pred_time=pred_time,
         params={"lags": p},
         y_pred_train=model.predict(X_train.values),
         y_pred_test=pred_test,
@@ -856,6 +1243,49 @@ def _select_model_family_and_candidates(
 
     return models, selected
 
+def _log_target_comparison(
+    target_name: str,
+    horizon: int,
+    candidates: List[ModelCandidate],
+    our_model: Optional[ModelCandidate],
+) -> None:
+    """
+    Консольний лог порівняння моделей для цільового ряду:
+    SeasonalNaive, baseline ARIMA/SARIMA, нелінійні, НАШ МЕТОД (SARIMAX + exog).
+    Аналог таблички з Colab.
+    """
+    if not candidates:
+        return
+
+    print(f"\n=== Цільовий ряд: {target_name} (горизонт {horizon}) ===")
+    print("{:<22s} {:>8s} {:>8s} {:>8s} {:>9s} {:>9s}".format(
+        "Модель", "RMSE", "sMAPE", "MASE", "fit[s]", "pred[s]"
+    ))
+
+    for m in candidates:
+        rmse_val = m.rmse if m.rmse is not None else float("nan")
+        smape_val = m.smape if m.smape is not None else float("nan")
+        mase_val = m.mase if m.mase is not None else float("nan")
+        print("{:<22s} {:>8.3f} {:>8.2f} {:>8.3f} {:>9.3f} {:>9.3f}".format(
+            m.model_type,
+            rmse_val,
+            smape_val,
+            mase_val,
+            m.fit_time,
+            m.pred_time,
+        ))
+
+    if our_model is None or our_model.mase is None or not math.isfinite(our_model.mase):
+        return
+
+    print(f"\nПоліпшення нашого методу ({our_model.model_type}) за MASE:")
+    for m in candidates:
+        if m is our_model or m.mase is None or not math.isfinite(m.mase) or m.mase <= 0:
+            continue
+        improvement = 100.0 * (m.mase - our_model.mase) / m.mase
+        print(f"  vs {m.model_type:18s}: {improvement:6.2f} %")
+
+
 
 # =========================
 # Main experiment procedure
@@ -863,11 +1293,17 @@ def _select_model_family_and_candidates(
 
 def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
     """
-    Повна реалізація методу (8 кроків), узгоджена з текстом дисертації.
-    Тепер повертаємо тільки backtest (train/test), без future-прогнозів.
+    Повна реалізація комбінованого методу (8 кроків), узгоджена з текстом дисертації.
+    Повертаємо:
+      - діагностику рядів та базових змінних;
+      - кореляції та лаги;
+      - факторний блок (VIF, PCA, стабільність);
+      - моделі (усі кандидати + позначена обрана);
+      - backtest-прогнози (train/test) для базових і таргетних рядів;
+      - colab-style порівняння моделей для таргетів на горизонтах H=1,2,3.
     """
 
-    # 1. Приведення до єдиної періодичності (місячна)
+    # 1. Приведення до єдиної періодичності (місячна шкала)
     df_raw = _build_dataframe(req)
     df_m = _align_to_monthly(df_raw, req.frequency)
     df_m = _impute(df_m, req.imputation)
@@ -875,7 +1311,7 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
     roles: Dict[str, Role] = {s.name: s.role for s in req.series}
     targets = [n for n, r in roles.items() if r == "target"]
 
-    # 2. Діагностика рядів
+    # 2. Діагностика рядів у вихідній шкалі
     diagnostics: Dict[str, Any] = {"series": {}}
     for name in df_m.columns:
         diagnostics["series"][name] = _series_diagnostics(
@@ -884,7 +1320,7 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
             req.horizon,
         )
 
-    # 2b. Стаціонарні ряди для кореляцій/факторного аналізу
+    # 2b. Стаціонарні ряди для кореляцій / факторного аналізу
     df_stat = pd.DataFrame(
         {
             name: _make_stationary_series(
@@ -896,7 +1332,7 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
         }
     )
 
-    # meta-інфа про період даних
+    # meta-інформація про період даних
     if len(df_m.index) > 0:
         diagnostics["meta"] = {
             "start": df_m.index.min().strftime("%Y-%m-%d"),
@@ -910,14 +1346,14 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
             "n_rows": 0,
         }
 
-    # 2. Кореляції + лаги (на df_stat)
+    # 2c. Кореляції + лаги (на df_stat)
     corr_struct, lag_edges = _compute_correlations(df_stat, req.max_lag)
     correlations = {
         "matrices": corr_struct,
         "edges": lag_edges,
     }
 
-    # 3. Базові змінні (df_stat, VIF, PCA)
+    # 3. Вибір базових змінних (candidate → base) + VIF/PCA/стабільність
     base_vars, factors_info = _select_base_variables(
         df_stat,
         roles,
@@ -925,7 +1361,7 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
         req.max_lag,
     )
 
-    # 4. Статистична обробка базових змінних
+    # 4. Статистична обробка базових змінних (зберігаємо список)
     diagnostics["base_variables"] = base_vars
 
     models: List[ModelInfo] = []
@@ -933,9 +1369,10 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
     forecast_base: List[ForecastPoint] = []
     forecast_macro: List[ForecastPoint] = []
 
-    # 5–6. Моделі для базових змінних (у вихідній шкалі), тільки backtest
-    base_df = df_m[base_vars].copy() if base_vars else pd.DataFrame(index=df_m.index)
     allow_gbr = bool(req.extra.get("allow_gbr", True))
+
+    # 5–6. Прогнозні моделі для базових змінних (без exog), тільки backtest
+    base_df = df_m[base_vars].copy() if base_vars else pd.DataFrame(index=df_m.index)
 
     for name in base_vars:
         y = base_df[name].astype("float64")
@@ -944,7 +1381,7 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
         cand_models, selected = _select_model_family_and_candidates(
             name=name,
             y=y,
-            exog_for_sarimax=None,  # базові ряди без exog
+            exog_for_sarimax=None,  # базові ряди без екзогенних
             diag=diag,
             horizon=req.horizon,
             max_lag=req.max_lag,
@@ -953,7 +1390,7 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
         if not cand_models or selected is None:
             continue
 
-        # зберігаємо моделі + метрики
+        # 5–6a. Зберігаємо всі кандидатні моделі + позначаємо обрану
         for m in cand_models:
             models.append(
                 ModelInfo(
@@ -978,7 +1415,7 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
                 )
             )
 
-        # ПРОГНОЗИ БАЗОВИХ: тільки train + test
+        # 5–6b. Backtest-прогнози для базових (train + test)
         # train
         for date, val_pred in zip(selected.dates_train, selected.y_pred_train):
             actual = float(df_m.loc[date, name]) if date in df_m.index else None
@@ -1008,16 +1445,17 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
                 )
             )
 
-    # 7. Прогноз таргетів із exog (тільки backtest)
+    # 7. Прогноз цільових рядів із використанням базових змінних як exog
     for t_name in targets:
         y = df_m[t_name].astype("float64")
+        diag_t = diagnostics["series"][t_name]
+        has_seasonality = bool(diag_t.get("has_seasonality"))
 
-        # lag-екзогенні з базових змінних
+        # 7.1. Формуємо екзогенні регресори з базових змінних (з урахуванням лагів)
         exog_cols: Dict[str, pd.Series] = {}
         for base in base_vars:
             rel_edges = [
-                e
-                for e in lag_edges
+                e for e in lag_edges
                 if e["source"] == base and e["target"] == t_name
             ]
             if not rel_edges:
@@ -1031,40 +1469,106 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
             if lag > 0:
                 exog_cols[f"{base}_lag{lag}"] = s.shift(lag)
             else:
+                # lag <= 0 — використовуємо поточне значення
                 exog_cols[f"{base}_lag0"] = s
 
-        exog_df = pd.DataFrame(exog_cols).astype("float64") if exog_cols else None
+        exog_df = (
+            pd.DataFrame(exog_cols).astype("float64") if exog_cols else None
+        )
 
-        # прибираємо NaN/inf і вирівнюємо з датами y
-        if exog_df is not None:
-            exog_df = exog_df.reindex(df_m.index)
-            exog_df = exog_df.replace([np.inf, -np.inf], np.nan)
-            exog_df = exog_df.fillna(method="bfill").fillna(method="ffill")
-
-        diag_t = diagnostics["series"][t_name]
-
-        # кандидати: SeasonalNaive + SARIMAX
+        # 7.2. Кандидатні моделі для таргетного ряду
         cand_models: List[ModelCandidate] = []
-        naive_model = _fit_seasonal_naive(t_name, y, req.horizon, m=12)
-        cand_models.append(naive_model)
 
-        sarimax_model = _fit_sarimax(
+        # (a) Бенчмарк: сезонний наївний
+        benchmark = _fit_seasonal_naive(t_name, y, req.horizon, m=12)
+        cand_models.append(benchmark)
+
+        # (b) Базові лінійні моделі без exog: ARIMA та SARIMA
+        arima_baseline = _fit_sarimax(
+            name=t_name,
+            y=y,
+            exog=None,
+            horizon=req.horizon,
+            has_seasonality=False,
+        )
+        if arima_baseline is not None:
+            arima_baseline.model_type = "ARIMA"
+            arima_baseline.reason = "baseline: ARIMA без сезонності та exog"
+            cand_models.append(arima_baseline)
+
+        sarima_baseline: Optional[ModelCandidate] = None
+        if has_seasonality:
+            sarima_baseline = _fit_sarimax(
+                name=t_name,
+                y=y,
+                exog=None,
+                horizon=req.horizon,
+                has_seasonality=True,
+            )
+            if sarima_baseline is not None:
+                sarima_baseline.model_type = "SARIMA"
+                sarima_baseline.reason = "baseline: SARIMA без exog"
+                cand_models.append(sarima_baseline)
+
+        # (c) Дерева рішень із лагами цільового ряду: GBR та RF
+        gb_model: Optional[ModelCandidate] = None
+        rf_model: Optional[ModelCandidate] = None
+        if allow_gbr:
+            gb_model = _fit_gb_regressor(
+                name=t_name,
+                y=y,
+                horizon=req.horizon,
+                max_lag=req.max_lag,
+            )
+            if gb_model is not None:
+                gb_model.model_type = "GBR"
+                gb_model.reason = (
+                    "baseline: Gradient Boosting з лагами цільового ряду"
+                )
+                cand_models.append(gb_model)
+
+            rf_model = _fit_rf_regressor(
+                name=t_name,
+                y=y,
+                horizon=req.horizon,
+                max_lag=req.max_lag,
+            )
+            if rf_model is not None:
+                # reason вже заданий у _fit_rf_regressor
+                cand_models.append(rf_model)
+
+        # (d) Комбінований спосіб: SARIMAX із відібраними базовими змінними (наш пайплайн)
+        method_model = _fit_sarimax(
             name=t_name,
             y=y,
             exog=exog_df,
             horizon=req.horizon,
-            has_seasonality=bool(diag_t.get("has_seasonality")),
+            has_seasonality=has_seasonality,
         )
-        if sarimax_model is not None:
-            cand_models.append(sarimax_model)
+        if method_model is not None:
+            # ВАЖЛИВО: model_type лишається "SARIMAX".
+            # Комбінований спосіб = увесь пайплайн, а не одна модель.
+            method_model.model_type = "SARIMAX"
+            method_model.reason = (
+                "комбінований спосіб: таргет із базовими змінними як exogenous"
+            )
+            cand_models.append(method_model)
 
         if not cand_models:
             continue
 
-        # пріоритет SARIMAX
-        selected = sarimax_model or cand_models[0]
+        # 7.3. Обрана модель у термінах методу:
+        # комбінований спосіб → SARIMA → ARIMA → дерева → бенчмарк
+        selected = (
+            method_model
+            or sarima_baseline
+            or arima_baseline
+            or gb_model
+            or rf_model
+            or benchmark
+        )
 
-        # моделі + метрики
+        # 7.4. Зберігаємо всі моделі + позначаємо обрану
         for m in cand_models:
             models.append(
                 ModelInfo(
@@ -1089,50 +1593,17 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
                 )
             )
 
-        # оцінка ефективності vs бенчмарк (SeasonalNaive)
+        # 7.5. Ljung–Box для обраної моделі
         if "targets" not in diagnostics:
             diagnostics["targets"] = {}
-
-        bench_mase = _safe_num(naive_model.mase)
-        sel_mase = _safe_num(selected.mase)
-        bench_smape = _safe_num(naive_model.smape)
-        sel_smape = _safe_num(selected.smape)
-        bench_rmse = _safe_num(naive_model.rmse)
-        sel_rmse = _safe_num(selected.rmse)
-
-        gain_smape_pct = None
-        if (
-            bench_smape is not None
-            and sel_smape is not None
-            and bench_smape != 0
-        ):
-            gain_smape_pct = _safe_num(
-                100.0 * (bench_smape - sel_smape) / bench_smape
-            )
-
         diagnostics["targets"][t_name] = {
             "lb_pvalue": _safe_num(selected.lb_pvalue),
             "residuals_ok": bool(
                 selected.lb_pvalue is not None and selected.lb_pvalue > 0.05
             ),
-            "benchmark": {
-                "model_type": naive_model.model_type,
-                "mase": bench_mase,
-                "smape": bench_smape,
-                "rmse": bench_rmse,
-            },
-            "selected": {
-                "model_type": selected.model_type,
-                "mase": sel_mase,
-                "smape": sel_smape,
-                "rmse": sel_rmse,
-            },
-            "gain_vs_benchmark": {
-                "smape_pct": gain_smape_pct,  # % зниження sMAPE
-            },
         }
 
-        # ПРОГНОЗИ ТАРГЕТА: тільки train + test
+        # 7.6. Backtest-прогнози таргета (train + test)
         for date, val_pred in zip(selected.dates_train, selected.y_pred_train):
             actual = float(df_m.loc[date, t_name]) if date in df_m.index else None
             forecast_macro.append(
@@ -1160,6 +1631,28 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
                     set_type="test",
                 )
             )
+
+        # 7.7. Colab-style порівняння моделей на горизонтах H = 1,2,3
+        comparison = _evaluate_target_horizons(
+            name=t_name,
+            y=y,
+            exog_df=exog_df,
+            max_lag=req.max_lag,
+            allow_gbr=allow_gbr,
+            horizons=[1, 2, 3],
+        )
+        if comparison:
+            if "comparison" not in diagnostics:
+                diagnostics["comparison"] = {}
+            diagnostics["comparison"][t_name] = comparison
+
+        # (опційно) консольний лог: табличка як у Colab
+        _log_target_comparison(
+            target_name=t_name,
+            horizon=req.horizon,
+            candidates=cand_models,
+            our_model=method_model,
+        )
 
     forecasts = ForecastBundle(base=forecast_base, macro=forecast_macro)
 

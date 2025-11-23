@@ -32,7 +32,6 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
         if (cancelled) return;
         setExperiment(exp);
         setForecasts(fc);
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } catch (err: any) {
         if (cancelled) return;
         console.error(err);
@@ -47,7 +46,6 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
     };
   }, [experimentId]);
 
-  // 1-й useMemo — групуємо прогнози по рядах
   const forecastsBySeries = useMemo(() => {
     const map: Record<string, Forecast[]> = {};
     for (const f of forecasts) {
@@ -62,58 +60,38 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
     return map;
   }, [forecasts]);
 
-  // Діагностика / цілі / базові змінні — безпечні при experiment === null
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // діагностика / кореляції / фактори
   const diag = (experiment?.diagnostics || {}) as any;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const seriesDiag = (diag?.series || {}) as Record<string, any>;
   const targetsInfo: Record<string, any> = (diag?.targets ||
     {}) as Record<string, any>;
   const targetNames: string[] = Object.keys(targetsInfo);
   const baseVars: string[] = (diag?.base_variables || []) as string[];
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const correlations = (experiment?.correlations || {}) as any;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const factors = (experiment?.factors || {}) as any;
 
   const selectedModels = experiment?.models?.filter((m) => m.isSelected) ?? [];
   const meta = diag?.meta;
+  const comparison = diag?.comparison || {};
 
-  // 2-й useMemo — ефективність моделей по таргетах
+  // 1) ефективність комбінованого способу для таргетів:
+  //    беремо ТІЛЬКИ обрану модель для кожного таргета, без SeasonalNaive.
   const efficiencyRows = useMemo(() => {
     if (!experiment) return [];
 
-    return Object.keys(targetsInfo)
+    return targetNames
       .map((seriesName) => {
-        const metricsForSeries = experiment.metrics.filter(
+        const selectedForTarget = selectedModels.find(
           (m) => m.seriesName === seriesName
         );
+        if (!selectedForTarget) return null;
 
-        const benchmark = metricsForSeries.find(
-          (m) => m.modelType === "SeasonalNaive"
+        const metric = experiment.metrics.find(
+          (mm) =>
+            mm.seriesName === seriesName &&
+            mm.modelType === selectedForTarget.modelType
         );
-
-        const selectedModel = selectedModels.find(
-          (m) => m.seriesName === seriesName
-        );
-        const selectedMetric = selectedModel
-          ? metricsForSeries.find(
-            (m) => m.modelType === selectedModel.modelType
-          )
-          : undefined;
-
-        let gainSmape: number | null = null;
-        if (
-          benchmark?.smape != null &&
-          !Number.isNaN(benchmark.smape) &&
-          selectedMetric?.smape != null &&
-          !Number.isNaN(selectedMetric.smape) &&
-          benchmark.smape !== 0
-        ) {
-          const diff = benchmark.smape - selectedMetric.smape;
-          gainSmape = (diff / benchmark.smape) * 100;
-        }
 
         const tDiag = targetsInfo[seriesName] || {};
         const lbPvalue =
@@ -123,30 +101,36 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
             ? (tDiag.residuals_ok as boolean)
             : null;
 
-        if (!benchmark && !selectedMetric) return null;
-
         return {
           seriesName,
-          benchmark,
-          selectedMetric,
-          selectedModelType: selectedModel?.modelType ?? null,
-          gainSmape,
+          modelType: selectedForTarget.modelType,
+          mase:
+            typeof metric?.mase === "number" && !Number.isNaN(metric.mase)
+              ? metric.mase
+              : null,
+          smape:
+            typeof metric?.smape === "number" && !Number.isNaN(metric.smape)
+              ? metric.smape
+              : null,
+          rmse:
+            typeof metric?.rmse === "number" && !Number.isNaN(metric.rmse)
+              ? metric.rmse
+              : null,
           lbPvalue,
           residualsOk,
         };
       })
       .filter(Boolean) as Array<{
         seriesName: string;
-        benchmark?: (typeof experiment.metrics)[number];
-        selectedMetric?: (typeof experiment.metrics)[number];
-        selectedModelType: string | null;
-        gainSmape: number | null;
+        modelType: string;
+        mase: number | null;
+        smape: number | null;
+        rmse: number | null;
         lbPvalue: number | null;
         residualsOk: boolean | null;
       }>;
-  }, [experiment, selectedModels, targetsInfo]);
+  }, [experiment, selectedModels, targetNames, targetsInfo]);
 
-  // ---- тільки після всіх хуків робимо ранні return-и ----
   if (loading) {
     return <div style={{ padding: "1rem" }}>Завантаження...</div>;
   }
@@ -228,7 +212,13 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
               return (
                 <tr key={name}>
                   <td>{name}</td>
-                  <td>{role}</td>
+                  <td>
+                    {role === "target"
+                      ? "цільовий ряд"
+                      : role === "base"
+                        ? "базовий ряд"
+                        : role}
+                  </td>
                   <td>
                     {typeof info.mean === "number"
                       ? info.mean.toFixed(2)
@@ -342,13 +332,14 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
         )}
       </section>
 
-      {/* 4. Вибір моделей */}
+      {/* 4. Вибір моделей (обрані за методом) */}
       <section style={{ marginTop: "1.5rem" }}>
         <h3>4. Вибір моделей (обрані за методом)</h3>
         <table style={{ width: "100%", fontSize: "0.9rem" }}>
           <thead>
             <tr>
               <th style={{ textAlign: "left" }}>Ряд</th>
+              <th>Роль</th>
               <th>Модель</th>
               <th>MASE</th>
               <th>sMAPE</th>
@@ -356,94 +347,72 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
             </tr>
           </thead>
           <tbody>
-            {selectedModels.map((m) => (
-              <tr key={m.id}>
-                <td>{m.seriesName}</td>
-                <td>{m.modelType}</td>
-                <td>{m.mase != null ? m.mase.toFixed(3) : ""}</td>
-                <td>
-                  {m.smape != null ? m.smape.toFixed(1) + " %" : ""}
-                </td>
-                <td>{m.rmse != null ? m.rmse.toFixed(3) : ""}</td>
-              </tr>
-            ))}
+            {selectedModels.map((m) => {
+              const role = targetNames.includes(m.seriesName)
+                ? "цільовий ряд"
+                : baseVars.includes(m.seriesName)
+                  ? "базовий ряд"
+                  : "";
+              return (
+                <tr key={m.id}>
+                  <td>{m.seriesName}</td>
+                  <td>{role}</td>
+                  <td>{m.modelType}</td>
+                  <td>{m.mase != null ? m.mase.toFixed(3) : ""}</td>
+                  <td>{m.smape != null ? m.smape.toFixed(1) + " %" : ""}</td>
+                  <td>{m.rmse != null ? m.rmse.toFixed(3) : ""}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </section>
 
-      {/* 5. Оцінка ефективності моделей */}
+      {/* 5. Оцінка ефективності комбінованого способу (тільки таргети, без SeasonalNaive в UI) */}
       <section style={{ marginTop: "1.5rem" }}>
-        <h3>5. Оцінка ефективності моделей (таргетні ряди)</h3>
+        <h3>5. Оцінка ефективності комбінованого способу (таргетні ряди)</h3>
         {efficiencyRows.length === 0 ? (
-          <div>Немає метрик для таргетних рядів.</div>
+          <div style={{ fontSize: "0.9rem" }}>
+            Немає даних для таргетних рядів.
+          </div>
         ) : (
-          <table style={{ width: "100%", fontSize: "0.9rem" }}>
+          <table style={{ width: "100%", fontSize: "0.8rem" }}>
             <thead>
               <tr>
                 <th style={{ textAlign: "left" }}>Ряд</th>
-                <th>Бенчмарк</th>
-                <th>MASE (бенч.)</th>
-                <th>sMAPE (бенч.)</th>
-                <th>RMSE (бенч.)</th>
                 <th>Обрана модель</th>
                 <th>MASE</th>
                 <th>sMAPE</th>
                 <th>RMSE</th>
-                <th>Δ sMAPE, %</th>
-                <th>LB p-value</th>
+                <th>p-value Ljung–Box</th>
+                <th>Залишки ок?</th>
               </tr>
             </thead>
             <tbody>
               {efficiencyRows.map((row) => (
                 <tr key={row.seriesName}>
                   <td>{row.seriesName}</td>
-                  <td>{row.benchmark?.modelType ?? "—"}</td>
+                  <td>{row.modelType}</td>
                   <td>
-                    {row.benchmark?.mase != null
-                      ? row.benchmark.mase.toFixed(3)
+                    {row.mase != null ? row.mase.toFixed(3) : ""}
+                  </td>
+                  <td>
+                    {row.smape != null ? row.smape.toFixed(1) + " %" : ""}
+                  </td>
+                  <td>
+                    {row.rmse != null ? row.rmse.toFixed(3) : ""}
+                  </td>
+                  <td>
+                    {row.lbPvalue != null
+                      ? row.lbPvalue.toFixed(3)
                       : ""}
                   </td>
                   <td>
-                    {row.benchmark?.smape != null
-                      ? row.benchmark.smape.toFixed(1) + " %"
-                      : ""}
-                  </td>
-                  <td>
-                    {row.benchmark?.rmse != null
-                      ? row.benchmark.rmse.toFixed(3)
-                      : ""}
-                  </td>
-                  <td>{row.selectedModelType ?? "—"}</td>
-                  <td>
-                    {row.selectedMetric?.mase != null
-                      ? row.selectedMetric.mase.toFixed(3)
-                      : ""}
-                  </td>
-                  <td>
-                    {row.selectedMetric?.smape != null
-                      ? row.selectedMetric.smape.toFixed(1) + " %"
-                      : ""}
-                  </td>
-                  <td>
-                    {row.selectedMetric?.rmse != null
-                      ? row.selectedMetric.rmse.toFixed(3)
-                      : ""}
-                  </td>
-                  <td>
-                    {row.gainSmape != null
-                      ? row.gainSmape.toFixed(1) + " %"
-                      : ""}
-                  </td>
-                  <td>
-                    {row.lbPvalue != null ? row.lbPvalue.toFixed(3) : ""}
-                    {row.residualsOk != null && (
-                      <>
-                        <br />
-                        <span style={{ fontSize: "0.8rem" }}>
-                          {row.residualsOk ? "залишки ОК" : "залишки проблемні"}
-                        </span>
-                      </>
-                    )}
+                    {row.residualsOk == null
+                      ? ""
+                      : row.residualsOk
+                        ? "так"
+                        : "ні"}
                   </td>
                 </tr>
               ))}
@@ -501,6 +470,100 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                 </tbody>
               </table>
             </details>
+          );
+        })}
+      </section>
+
+      {/* 7. Порівняння моделей (горизонти 1–3 місяці) */}
+      <section style={{ marginTop: "1.5rem" }}>
+        <h3>7. Порівняння моделей (горизонти 1–3 місяці)</h3>
+
+        {targetNames.map((t) => {
+          const cmp = (comparison && (comparison as any)[t]) || null;
+          if (!cmp) return null;
+
+          const horizons = Object.keys(cmp)
+            .map((h) => Number(h))
+            .sort((a, b) => a - b);
+          if (!horizons.length) return null;
+
+          return (
+            <div key={t} style={{ marginBottom: "1rem" }}>
+              <h4>{t}</h4>
+
+              {horizons.map((h) => {
+                const famRes = (cmp as any)[h];
+                if (!famRes) return null;
+                const families = Object.keys(famRes);
+                if (!families.length) return null;
+
+                return (
+                  <details
+                    key={h}
+                    style={{ marginBottom: "0.5rem" }}
+                    open={h === 3}
+                  >
+                    <summary>Горизонт {h} місяць(і)</summary>
+                    <table
+                      style={{
+                        width: "100%",
+                        fontSize: "0.85rem",
+                        marginTop: "0.5rem",
+                      }}
+                    >
+                      <thead>
+                        <tr>
+                          <th style={{ textAlign: "left" }}>Модель</th>
+                          <th>MASE</th>
+                          <th>sMAPE</th>
+                          <th>RMSE</th>
+                          <th>t навчання, c</th>
+                          <th>t прогнозу, c</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {families.map((fam) => {
+                          const r = (famRes as any)[fam] || {};
+                          const maseVal =
+                            typeof r.mase === "number" ? r.mase.toFixed(3) : "";
+                          const smapeVal =
+                            typeof r.smape === "number"
+                              ? r.smape.toFixed(2) + " %"
+                              : "";
+                          const rmseVal =
+                            typeof r.rmse === "number"
+                              ? r.rmse.toFixed(3)
+                              : "";
+                          const fitTimeVal =
+                            typeof r.fit_time === "number"
+                              ? r.fit_time.toFixed(3)
+                              : "";
+                          const predTimeVal =
+                            typeof r.pred_time === "number"
+                              ? r.pred_time.toFixed(3)
+                              : "";
+
+                          return (
+                            <tr key={fam}>
+                              <td>
+                                {fam === "SARIMA"
+                                  ? "SARIMA (наш метод)"
+                                  : fam}
+                              </td>
+                              <td>{maseVal}</td>
+                              <td>{smapeVal}</td>
+                              <td>{rmseVal}</td>
+                              <td>{fitTimeVal}</td>
+                              <td>{predTimeVal}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </details>
+                );
+              })}
+            </div>
           );
         })}
       </section>
