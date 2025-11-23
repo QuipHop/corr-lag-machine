@@ -397,7 +397,7 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
             <thead>
               <tr>
                 <th style={thStyle}>Ряд</th>
-                <th style={thStyle}>Обрана модель</th>
+                <th style={thStyle}>Обрана модель (наш метод)</th>
                 <th style={thStyle}>MASE</th>
                 <th style={thStyle}>sMAPE</th>
                 <th style={thStyle}>RMSE</th>
@@ -450,7 +450,9 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
           if (!exogList.length) return null;
           return (
             <div key={t} style={{ marginTop: "0.5rem", fontSize: "0.85rem" }}>
-              <strong>Для ряду {t} в комбінованому способі використано exogenous:</strong>{" "}
+              <strong>
+                Для ряду {t} в комбінованому способі використано exogenous:
+              </strong>{" "}
               {exogList
                 .map((e) => {
                   const base = e.base ?? e.base_name ?? "?";
@@ -471,9 +473,11 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
         )}
 
         {targetNames.map((seriesName) => {
-          // !!! CHANGE: Include future points
           const seriesForecasts = (forecastsBySeries[seriesName] || []).filter(
-            (f) => f.setType === "train" || f.setType === "test" || f.setType === "future"
+            (f) =>
+              f.setType === "train" ||
+              f.setType === "test" ||
+              f.setType === "future"
           );
           if (!seriesForecasts.length) return null;
 
@@ -492,7 +496,11 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                 <svg
                   viewBox="0 0 400 200"
                   preserveAspectRatio="none"
-                  style={{ width: "100%", height: "160px", background: "#ffffff" }}
+                  style={{
+                    width: "100%",
+                    height: "160px",
+                    background: "#ffffff",
+                  }}
                 >
                   {(() => {
                     const points = seriesForecasts;
@@ -505,7 +513,7 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                       .map((p) => p.valuePred)
                       .filter((v) => v != null) as number[];
 
-                    if (!ysPred.length) return null; // Actual might be missing in future
+                    if (!ysPred.length) return null;
 
                     const allY = [...ysActual, ...ysPred];
                     const yMin = Math.min(...allY);
@@ -536,24 +544,32 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                       return coords.join(" ");
                     };
 
-                    // Split actual line
                     const actualLine = line(
                       points.map((p) => p.valueActual ?? null)
                     );
 
-                    // Pred line (train/test/future)
                     const predLine = line(
                       points.map((p) => p.valuePred ?? null)
                     );
 
-                    // Divider for future start
-                    const firstFutureIdx = points.findIndex(p => p.setType === 'future');
-                    const futureX = firstFutureIdx >= 0 ? scaleX(firstFutureIdx) : null;
+                    const firstFutureIdx = points.findIndex(
+                      (p) => p.setType === "future"
+                    );
+                    const futureX =
+                      firstFutureIdx >= 0 ? scaleX(firstFutureIdx) : null;
 
                     return (
                       <>
                         {futureX !== null && (
-                          <line x1={futureX} y1={0} x2={futureX} y2={200} stroke="#ff0000" strokeWidth={1} strokeDasharray="2 2" />
+                          <line
+                            x1={futureX}
+                            y1={0}
+                            x2={futureX}
+                            y2={200}
+                            stroke="#000000"
+                            strokeWidth={1}
+                            strokeDasharray="3 3"
+                          />
                         )}
                         <polyline
                           points={actualLine}
@@ -564,9 +580,9 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                         <polyline
                           points={predLine}
                           fill="none"
-                          stroke="#2f855a"
+                          stroke="#000000"
                           strokeWidth={1.5}
-                          strokeDasharray="4 1"
+                          strokeDasharray="4 2"
                         />
                       </>
                     );
@@ -590,7 +606,7 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                   </tr>
                 </thead>
                 <tbody>
-                  {seriesForecasts.slice(-12).map((f) => ( // Show last 12 points
+                  {seriesForecasts.slice(-12).map((f) => (
                     <tr key={`${f.seriesName}-${f.date}-${f.setType}`}>
                       <td style={tdStyle}>{f.date.slice(0, 10)}</td>
                       <td style={tdStyle}>{f.setType}</td>
@@ -626,13 +642,25 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
 
           const selected = selectedBySeries[t];
 
+          // Мапимо modelType → ключ у comparison
+          const selectedFamilyKey: string | null = (() => {
+            if (!selected || !selected.modelType) return null;
+            const mt = selected.modelType;
+            if (mt === "GBR" || mt === "GB") return "GB";
+            if (mt === "RF") return "RF";
+            if (mt === "SARIMAX") return "SARIMAX";
+            if (mt === "SARIMA") return "SARIMA";
+            if (mt === "ARIMA") return "ARIMA";
+            return mt;
+          })();
+
           return (
             <div key={t} style={{ marginBottom: "1rem" }}>
               <h4>{t}</h4>
 
               {selected && (
                 <div style={{ fontSize: "0.85rem", marginBottom: "0.25rem" }}>
-                  Наш метод (обрана модель для {t}):{" "}
+                  Наш метод (пайплайн):{" "}
                   <strong>{selected.modelType}</strong>
                 </div>
               )}
@@ -640,8 +668,84 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
               {horizons.map((h) => {
                 const famRes = (cmp as any)[h];
                 if (!famRes) return null;
-                const families = Object.keys(famRes);
-                if (!families.length) return null;
+
+                const familyKeys = Object.keys(famRes);
+                if (!familyKeys.length) return null;
+
+                // стабільний порядок виводу
+                const orderedFamilies = [
+                  "SeasonalNaive",
+                  "ARIMA",
+                  "SARIMA",
+                  "GB",
+                  "RF",
+                  "SARIMAX",
+                  "OUR_METHOD",
+                  ...familyKeys,
+                ].filter(
+                  (v, idx, arr) => familyKeys.includes(v) && arr.indexOf(v) === idx
+                );
+
+                // для обчислення % поліпшення по MASE
+                const selectedMetrics =
+                  selectedFamilyKey && famRes[selectedFamilyKey]
+                    ? famRes[selectedFamilyKey]
+                    : null;
+
+                const improvements: string[] = [];
+
+                if (
+                  selectedFamilyKey &&
+                  selectedMetrics &&
+                  typeof selectedMetrics.mase === "number" &&
+                  isFinite(selectedMetrics.mase)
+                ) {
+                  const maseOur = selectedMetrics.mase;
+                  const smapeOur = selectedMetrics.smape; // Беремо наш sMAPE
+
+                  for (const fam of orderedFamilies) {
+                    if (fam === selectedFamilyKey) continue;
+                    const rOther = famRes[fam];
+
+                    if (!rOther) continue;
+
+                    let textParts: string[] = [];
+                    let hasData = false;
+
+                    // --- 1. Порівняння MASE ---
+                    if (
+                      typeof rOther.mase === "number" &&
+                      isFinite(rOther.mase) &&
+                      rOther.mase > 0
+                    ) {
+                      // Формула: (Чужий - Наш) / Чужий * 100
+                      // Якщо результат > 0, значить Наш менший (кращий) -> "+"
+                      const impMase =
+                        ((rOther.mase - maseOur) / rOther.mase) * 100.0;
+                      const sign = impMase > 0 ? "+" : "";
+                      textParts.push(`MASE ${sign}${impMase.toFixed(1)}%`);
+                      hasData = true;
+                    }
+
+                    // --- 2. Порівняння sMAPE ---
+                    if (
+                      typeof rOther.smape === "number" &&
+                      typeof smapeOur === "number" &&
+                      isFinite(rOther.smape) &&
+                      rOther.smape > 0
+                    ) {
+                      const impSmape =
+                        ((rOther.smape - smapeOur) / rOther.smape) * 100.0;
+                      const sign = impSmape > 0 ? "+" : "";
+                      textParts.push(`sMAPE ${sign}${impSmape.toFixed(1)}%`);
+                      hasData = true;
+                    }
+
+                    if (hasData) {
+                      improvements.push(`${fam}: ${textParts.join(", ")}`);
+                    }
+                  }
+                }
 
                 return (
                   <details
@@ -668,7 +772,7 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                         </tr>
                       </thead>
                       <tbody>
-                        {families.map((fam) => {
+                        {orderedFamilies.map((fam) => {
                           const r = (famRes as any)[fam] || {};
                           const maseVal =
                             typeof r.mase === "number" ? r.mase.toFixed(3) : "";
@@ -689,7 +793,15 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                               ? r.pred_time.toFixed(3)
                               : "";
 
+                          const isOur =
+                            selectedFamilyKey &&
+                            fam === selectedFamilyKey;
+
                           let label = fam;
+                          if (isOur) {
+                            label = `Наш метод (пайплайн, сімейство: ${fam})`;
+                          }
+
                           return (
                             <tr key={fam}>
                               <td style={tdStyle}>{label}</td>
@@ -703,6 +815,19 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                         })}
                       </tbody>
                     </table>
+
+                    {improvements.length > 0 && (
+                      <div
+                        style={{
+                          fontSize: "0.8rem",
+                          marginTop: "0.25rem",
+                          fontStyle: "italic",
+                        }}
+                      >
+                        Поліпшення нашого методу за MASE:&nbsp;
+                        {improvements.join("; ")}.
+                      </div>
+                    )}
                   </details>
                 );
               })}
