@@ -8,7 +8,7 @@ import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
 import { randomUUID } from 'crypto';
 
-import { RunExperimentDto, SeriesDto } from './dto/run-experiment.dto';
+import { RunExperimentDto } from './dto/run-experiment.dto';
 import { PrismaService } from '../shared/prisma.service';
 
 // Типи під ml-svc (мають співпасти з Python schemas)
@@ -30,28 +30,27 @@ type MlExperimentRequest = {
 };
 
 type MlModel = {
-  series_name: string;
-  model_type: string;
-  params: any;
+  seriesName: string;
+  modelType: string;
   mase: number | null;
   smape: number | null;
   rmse: number | null;
-  is_selected: boolean;
+  fit_time?: number | null;
+  pred_time?: number | null;
+  isSelected: boolean;
 };
 
 type MlForecastPoint = {
-  series_name: string;
+  seriesName: string;
   date: string;
-  value_actual: number | null;
-  value_pred: number | null;
-  lower_pi: number | null;
-  upper_pi: number | null;
-  set_type: string; // 'train' | 'test' | 'future'
+  valueActual: number | null;
+  valuePred: number | null;
+  setType: string; // 'train' | 'test' | 'future'
 };
 
 type MlMetric = {
-  series_name: string;
-  model_type: string;
+  seriesName: string;
+  modelType: string;
   horizon: number;
   mase: number | null;
   smape: number | null;
@@ -63,11 +62,8 @@ type MlExperimentResult = {
   correlations: any;
   factors: any;
   models: MlModel[];
-  forecasts: {
-    base: MlForecastPoint[];
-    macro: MlForecastPoint[];
-  };
-  metrics: MlMetric[];
+  forecasts: MlForecastPoint[];     // <-- тепер просто масив
+  metrics: MlMetric[];              // <-- окрема таблиця метрик
 };
 
 @Injectable()
@@ -157,37 +153,36 @@ export class ExperimentsService {
 
       // Models
       if (result.models?.length) {
-        await tx.model.createMany({
-          data: result.models.map((m) => ({
+        const modelRows = result.models
+          .filter((m) => !!m.seriesName && !!m.modelType)
+          .map((m) => ({
             experimentId,
-            seriesName: m.series_name,
-            modelType: m.model_type,
-            paramsJson: m.params ?? {},
+            seriesName: m.seriesName,
+            modelType: m.modelType,
+            paramsJson: {}, // в Python params поки не заповнюємо
             mase: m.mase,
             smape: m.smape,
             rmse: m.rmse,
-            isSelected: m.is_selected ?? false,
-          })),
-        });
+            isSelected: m.isSelected ?? false,
+          }));
+
+        if (modelRows.length) {
+          await tx.model.createMany({ data: modelRows });
+        }
       }
 
-      // Forecasts (base + macro)
-      const forecastRows: MlForecastPoint[] = [
-        ...(result.forecasts.base ?? []),
-        ...(result.forecasts.macro ?? []),
-      ];
-
-      if (forecastRows.length) {
+      // Forecasts
+      if (result.forecasts?.length) {
         await tx.forecast.createMany({
-          data: forecastRows.map((f) => ({
+          data: result.forecasts.map((f) => ({
             experimentId,
-            seriesName: f.series_name,
+            seriesName: f.seriesName,
             date: new Date(f.date),
-            valueActual: f.value_actual,
-            valuePred: f.value_pred,
-            lowerPi: f.lower_pi,
-            upperPi: f.upper_pi,
-            setType: f.set_type,
+            valueActual: f.valueActual,
+            valuePred: f.valuePred,
+            lowerPi: null,
+            upperPi: null,
+            setType: f.setType,
           })),
         });
       }
@@ -197,12 +192,12 @@ export class ExperimentsService {
         await tx.experimentMetric.createMany({
           data: result.metrics.map((m) => ({
             experimentId,
-            seriesName: m.series_name,
-            modelType: m.model_type,
+            seriesName: m.seriesName,
+            modelType: m.modelType,
             horizon: m.horizon,
-            mase: m.mase ?? 0,   // <- тут фіксимо
-            smape: m.smape ?? 0, // <- тут фіксимо
-            rmse: m.rmse ?? 0,   // <- тут фіксимо
+            mase: m.mase ?? 0,
+            smape: m.smape ?? 0,
+            rmse: m.rmse ?? 0,
           })),
         });
       }

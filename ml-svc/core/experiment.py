@@ -4,23 +4,24 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import math
+import time
+
 import numpy as np
 import pandas as pd
-import time
-import scipy.stats as stats
-
 from pydantic import BaseModel, Field
 
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller, kpss
 from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.metrics import mean_squared_error
 
 
 # =========================
-# Pydantic request / response
+# Типи запиту/відповіді
 # =========================
 
 Role = Literal["target", "candidate", "ignored"]
@@ -35,824 +36,1119 @@ class SeriesPayload(BaseModel):
 
 
 class ExperimentRequest(BaseModel):
-    experiment_id: str
-    dates: List[str]
+    # від Nest
+    experiment_id: Optional[str] = None
+    dates: Optional[List[str]] = None
+
     series: List[SeriesPayload]
-    frequency: Frequency
-    horizon: int = Field(..., gt=0)
+    frequency: Frequency = "M"
+    horizon: int = 12
     imputation: Imputation = "ffill"
     max_lag: int = 12
+    start_date: Optional[str] = None  # якщо dates немає
     extra: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ModelInfo(BaseModel):
-    series_name: str
-    model_type: str
-    params: Dict[str, Any] = Field(default_factory=dict)
+    # camelCase для прямої роботи з Nest/React
+    seriesName: str
+    modelType: str
     mase: Optional[float] = None
     smape: Optional[float] = None
     rmse: Optional[float] = None
-    is_selected: bool = False
-    reason: Optional[str] = None
+    fit_time: Optional[float] = None
+    pred_time: Optional[float] = None
+    isSelected: bool = False
 
 
 class ForecastPoint(BaseModel):
-    series_name: str
+    seriesName: str
     date: str
-    value_actual: Optional[float]
-    value_pred: Optional[float]
-    lower_pi: Optional[float]
-    upper_pi: Optional[float]
-    set_type: str
+    setType: Literal["train", "test", "future"]
+    valueActual: Optional[float] = None
+    valuePred: Optional[float] = None
 
 
-class ForecastBundle(BaseModel):
-    base: List[ForecastPoint] = Field(default_factory=list)
-    macro: List[ForecastPoint] = Field(default_factory=list)
-
-
-class MetricRow(BaseModel):
-    series_name: str
-    model_type: str
+class MetricInfo(BaseModel):
+    seriesName: str
+    modelType: str
     horizon: int
-    mase: Optional[float]
+    mase: Optional[float] = None
     smape: Optional[float] = None
     rmse: Optional[float] = None
 
 
 class ExperimentResult(BaseModel):
+    id: str = Field(default_factory=lambda: "exp-" + str(int(time.time())))
     diagnostics: Dict[str, Any]
     correlations: Dict[str, Any]
     factors: Dict[str, Any]
     models: List[ModelInfo]
-    forecasts: ForecastBundle
-    metrics: List[MetricRow]
+    forecasts: List[ForecastPoint]
+    metrics: List[MetricInfo] = Field(default_factory=list)
+
+def _to_python(obj: Any) -> Any:
+    """
+    Рекурсивно перетворює numpy/pandas-типи на звичайні Python-скаляри,
+    щоб Pydantic міг їх серіалізувати.
+    """
+    # --- скаляри numpy / python ---
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+
+    if isinstance(obj, np.integer):
+        return int(obj)
+
+    if isinstance(obj, np.floating):
+        return float(obj)
+
+    # --- numpy масиви ---
+    if isinstance(obj, np.ndarray):
+        return [_to_python(v) for v in obj.tolist()]
+
+    # --- pandas дати / періоди ---
+    if isinstance(obj, (pd.Timestamp, pd.Timedelta, pd.Period)):
+        return obj.isoformat()
+
+    # --- pandas Index (включно з RangeIndex, Int64Index, тощо у pandas 2.x) ---
+    if isinstance(obj, pd.Index):
+        return [_to_python(v) for v in obj.tolist()]
+
+    # --- dict / list / tuple рекурсивно ---
+    if isinstance(obj, dict):
+        return {str(k): _to_python(v) for k, v in obj.items()}
+
+    if isinstance(obj, list):
+        return [_to_python(v) for v in obj]
+
+    if isinstance(obj, tuple):
+        return tuple(_to_python(v) for v in obj)
+
+    # все інше лишаємо як є (str, float, int, None, bool, ...)
+    return obj
+
+def _detect_nonlinearity(x: pd.Series) -> bool:
+    """
+    Грубий детектор монотонної нелінійності.
+    Ідея: якщо Spearman по лагу 1 суттєво відрізняється від Pearson – є нелінійність.
+    """
+    x = x.dropna()
+    if len(x) < 30:
+        return False
+
+    x_lag = x.shift(1).dropna()
+    x_cur = x.iloc[1:len(x)]
+    x_cur = x_cur.loc[x_lag.index]
+
+    if len(x_cur) < 20:
+        return False
+
+    try:
+        pearson = x_cur.corr(x_lag, method="pearson")
+        spearman = x_cur.corr(x_lag, method="spearman")
+    except Exception:
+        return False
+
+    if pearson is None or spearman is None:
+        return False
+    if math.isnan(pearson) or math.isnan(spearman):
+        return False
+
+    # якщо Spearman значно більший за Pearson — монотонна нелінійність
+    return abs(spearman - pearson) > 0.15 and abs(spearman) > abs(pearson)
 
 
 # =========================
-# Internal Data Structures
+# 1–2. Dataframe + діагностика
+# =========================
+
+def _build_dataframe(req: ExperimentRequest) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    max_len = max(len(s.values) for s in req.series)
+    data: Dict[str, List[Optional[float]]] = {}
+    for sp in req.series:
+        vals = list(sp.values)
+        if len(vals) < max_len:
+            vals += [None] * (max_len - len(vals))
+        data[sp.name] = vals
+
+    # Якщо прийшли дати з фронту — юзаємо їх
+    if req.dates:
+        idx = pd.to_datetime(req.dates[:max_len])
+    else:
+        if req.start_date:
+            idx = pd.date_range(start=req.start_date, periods=max_len, freq=req.frequency)
+        else:
+            idx = pd.date_range(start="2000-01-01", periods=max_len, freq=req.frequency)
+
+    df = pd.DataFrame(data, index=idx)
+
+    meta = {
+        "start": str(idx[0].date()),
+        "end": str(idx[-1].date()),
+        "n_rows": int(len(df)),
+        "frequency": req.frequency,
+    }
+
+    return df, meta
+
+
+def _impute_df(df: pd.DataFrame, mode: Imputation) -> pd.DataFrame:
+    if mode == "none":
+        return df
+    if mode == "ffill":
+        return df.ffill()
+    if mode == "bfill":
+        return df.bfill()
+    if mode == "interp":
+        return df.interpolate(limit_direction="both")
+    return df
+
+
+def _adf_test(x: pd.Series) -> float:
+    x = x.dropna()
+    if len(x) < 10:
+        return float("nan")
+    try:
+        res = adfuller(x, autolag="AIC")
+        return float(res[1])
+    except Exception:
+        return float("nan")
+
+
+def _kpss_test(x: pd.Series) -> float:
+    x = x.dropna()
+    if len(x) < 10:
+        return float("nan")
+    try:
+        res = kpss(x, regression="c", nlags="auto")
+        return float(res[1])
+    except Exception:
+        return float("nan")
+
+
+def _detect_seasonality(x: pd.Series, freq: Frequency) -> bool:
+    x = x.dropna()
+    if len(x) < 24:
+        return False
+    acf_vals = sm.tsa.stattools.acf(x, nlags=24, fft=True)
+    if freq == "M":
+        s_lag = 12
+    elif freq == "Q":
+        s_lag = 4
+    else:
+        s_lag = 1
+    if s_lag < len(acf_vals) and abs(acf_vals[s_lag]) > 0.3:
+        return True
+    return False
+
+
+def _acf_at_lag(x: pd.Series, lag: int) -> float:
+    x = x.dropna()
+    if len(x) <= lag:
+        return float("nan")
+    acf_vals = sm.tsa.stattools.acf(x, nlags=lag, fft=True)
+    return float(acf_vals[lag])
+
+
+def _format_transform(info: Dict[str, Any]) -> str:
+    """Людське представлення трансформацій: log/diff/seas."""
+    parts: List[str] = []
+    if info.get("log"):
+        parts.append("log")
+    if info.get("diff", 0) > 0:
+        parts.append(f"diff({info['diff']})")
+    if info.get("seas_diff", 0) > 0:
+        parts.append(f"seas({info['seas_diff']})")
+    if not parts:
+        return "none"
+    return " + ".join(parts)
+
+
+def _compute_series_diagnostics(
+    df: pd.DataFrame,
+    freq: Frequency,
+    trans_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Базова діагностика рядів:
+    - mean, std
+    - ADF/KPSS
+    - наявність сезонності
+    - ACF(12)
+    - skew/kurtosis
+    - індикатор нелінійності (форма розподілу + Spearman vs Pearson)
+    - трансформації (log/diff/seas) з _make_stationary
+    """
+    out: Dict[str, Any] = {}
+    for name in df.columns:
+        s = df[name].dropna()
+        if s.empty:
+            out[name] = {
+                "mean": float("nan"),
+                "std": float("nan"),
+                "adf_p": float("nan"),
+                "kpss_p": float("nan"),
+                "has_seasonality": False,
+                "acf_12": float("nan"),
+                "skew": float("nan"),
+                "kurtosis": float("nan"),
+                "transform": "none",
+                "is_nonlinear": False,
+            }
+            continue
+
+        mean = float(s.mean())
+        std = float(s.std())
+        adf_p = _adf_test(s)
+        kpss_p = _kpss_test(s)
+        has_seas = _detect_seasonality(s, freq)
+        acf12 = _acf_at_lag(s, 12) if freq == "M" else float("nan")
+
+        skew = float(s.skew())
+        kurt = float(s.kurtosis())  # ексцес
+
+        # 1) форма розподілу
+        nonlinear_shape = (abs(skew) > 1.0) or (kurt > 3.5)
+        # 2) Spearman vs Pearson по лагу 1
+        nonlinear_spearman = _detect_nonlinearity(s)
+
+        is_nonlinear = nonlinear_shape or nonlinear_spearman
+
+        transform_label = "none"
+        if trans_info and name in trans_info:
+            transform_label = _format_transform(trans_info[name])
+
+        out[name] = {
+            "mean": mean,
+            "std": std,
+            "adf_p": adf_p,
+            "kpss_p": kpss_p,
+            "has_seasonality": has_seas,
+            "acf_12": acf12,
+            "skew": skew,
+            "kurtosis": kurt,
+            "transform": transform_label,
+            "is_nonlinear": is_nonlinear,
+            # Якщо хочеш дебажити — можна також вивести:
+            # "nonlinear_shape": nonlinear_shape,
+            # "nonlinear_spearman": nonlinear_spearman,
+        }
+    return out
+
+
+def _make_stationary(df: pd.DataFrame, freq: Frequency) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Проста схема: log (якщо всі > 0) + перша різниця при нестабільності рівня +
+    сезонна різниця при сезонності.
+    """
+    trans_info: Dict[str, Any] = {}
+    df_tr = df.copy()
+
+    for name in df.columns:
+        s = df[name]
+        info = {
+            "log": False,
+            "diff": 0,
+            "seas_diff": 0,
+        }
+
+        s_tr = s.astype(float)
+
+        if (s_tr > 0).all():
+            s_tr = np.log(s_tr)
+            info["log"] = True
+
+        adf_p = _adf_test(s_tr)
+        kpss_p = _kpss_test(s_tr)
+
+        # Перша різниця за потреби
+        if (not math.isnan(adf_p) and adf_p > 0.05) or (not math.isnan(kpss_p) and kpss_p < 0.05):
+            s_tr = s_tr.diff()
+            info["diff"] = 1
+
+        # Сезонна різниця
+        has_seas = _detect_seasonality(s_tr.dropna(), freq)
+        if has_seas:
+            if freq == "M":
+                lag = 12
+            elif freq == "Q":
+                lag = 4
+            else:
+                lag = 1
+            if lag > 1:
+                s_tr = s_tr.diff(lag)
+                info["seas_diff"] = lag
+
+        df_tr[name] = s_tr
+        trans_info[name] = info
+
+    return df_tr, trans_info
+
+
+# =========================
+# 3–4. Кореляції, базові змінні, VIF
+# =========================
+
+def _cross_correlation(
+    x: pd.Series, y: pd.Series, max_lag: int = 12
+) -> Dict[str, Any]:
+    """
+    Рахуємо Pearson та Spearman на різних лагах.
+    Для вибору "силу зв'язку" беремо ту метрику (r чи rho), де |кореляція| більша.
+    """
+    x = x.dropna()
+    y = y.dropna()
+    if len(x) < 10 or len(y) < 10:
+        return {
+            "best_lag": 0,
+            "r_pearson": float("nan"),
+            "rho_spearman": float("nan"),
+            "r_at_best_lag": float("nan"),
+            "metric": "pearson",
+        }
+
+    best_lag = 0
+    best_val = 0.0
+    best_r = float("nan")
+    best_rho = float("nan")
+    best_metric = "pearson"
+
+    for lag in range(-max_lag, max_lag + 1):
+        if lag > 0:
+            xs = x.iloc[lag:]
+            ys = y.iloc[:-lag]
+        elif lag < 0:
+            xs = x.iloc[:lag]
+            ys = y.iloc[-lag:]
+        else:
+            xs = x
+            ys = y
+        if len(xs) < 10 or len(ys) < 10:
+            continue
+
+        r = xs.corr(ys, method="pearson")
+        rho = xs.corr(ys, method="spearman")
+
+        if r is None or math.isnan(r):
+            r = float("nan")
+        if rho is None or math.isnan(rho):
+            rho = float("nan")
+
+        # беремо ту, де |.| більше
+        cand_val = 0.0
+        cand_metric = "pearson"
+        if not math.isnan(r) and (math.isnan(rho) or abs(r) >= abs(rho)):
+            cand_val = float(r)
+            cand_metric = "pearson"
+        elif not math.isnan(rho):
+            cand_val = float(rho)
+            cand_metric = "spearman"
+        else:
+            continue
+
+        if abs(cand_val) > abs(best_val):
+            best_val = cand_val
+            best_metric = cand_metric
+            best_lag = lag
+            best_r = float(r)
+            best_rho = float(rho)
+
+    return {
+        "best_lag": best_lag,
+        "r_pearson": best_r,
+        "rho_spearman": best_rho,
+        "r_at_best_lag": best_val,
+        "metric": best_metric,
+    }
+
+
+def _compute_correlations(
+    df_st: pd.DataFrame,
+    targets: List[str],
+    candidates: List[str],
+    max_lag: int = 12,
+) -> Dict[str, Any]:
+    edges: List[Dict[str, Any]] = []
+
+    for t in targets:
+        for c in candidates:
+            if c == t:
+                continue
+            res = _cross_correlation(df_st[c], df_st[t], max_lag=max_lag)
+            if math.isnan(res["r_at_best_lag"]):
+                continue
+            edges.append(
+                {
+                    "source": c,
+                    "target": t,
+                    "best_lag": res["best_lag"],
+                    "r_pearson": res["r_pearson"],
+                    "rho_spearman": res["rho_spearman"],
+                    "r_at_best_lag": res["r_at_best_lag"],
+                    "metric": res["metric"],
+                }
+            )
+
+    return {"edges": edges}
+
+
+def _select_base_variables(corr: Dict[str, Any], threshold: float = 0.3) -> List[str]:
+    edges = corr.get("edges", [])
+    base_vars = set()
+    for e in edges:
+        if abs(e["r_at_best_lag"]) >= threshold:
+            base_vars.add(e["source"])
+    return sorted(base_vars)
+
+
+def _compute_vif(df: pd.DataFrame, cols: List[str]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    if len(cols) < 2:
+        for c in cols:
+            out[c] = float("nan")
+        return out
+
+    X = df[cols].dropna()
+    if X.empty:
+        for c in cols:
+            out[c] = float("nan")
+        return out
+
+    X = sm.add_constant(X)
+    for i, c in enumerate(X.columns):
+        if c == "const":
+            continue
+        try:
+            vif = variance_inflation_factor(X.values, i)
+        except Exception:
+            vif = float("nan")
+        out[c] = float(vif)
+
+    return out
+
+
+def mase(y_true: np.ndarray, y_pred: np.ndarray, y_insample: np.ndarray, m: int = 1) -> float:
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    mae_model = np.mean(np.abs(y_true - y_pred))
+
+    if len(y_insample) <= m:
+        return float("inf")
+    naive_diff = np.abs(y_insample[m:] - y_insample[:-m])
+    mae_naive = np.mean(naive_diff)
+    if mae_naive == 0:
+        return float("inf")
+    return float(mae_model / mae_naive)
+
+
+def smape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    denom = (np.abs(y_true) + np.abs(y_pred)) / 2.0
+    mask = denom != 0
+    if not mask.any():
+        return float("nan")
+    return float(np.mean(np.abs(y_true[mask] - y_pred[mask]) / denom[mask]) * 100.0)
+
+
+# =========================
+# 5. Walk-forward backtest
 # =========================
 
 @dataclass
-class ModelCandidate:
-    series_name: str
-    model_type: str
-    reason: str
+class FamilyResult:
     mase: float
     smape: float
     rmse: float
     fit_time: float
     pred_time: float
-    params: Dict[str, Any]
-    y_pred_train: np.ndarray
-    y_pred_test: np.ndarray
-    y_pred_future: np.ndarray
-    dates_train: pd.DatetimeIndex
-    dates_test: pd.DatetimeIndex
-    dates_future: pd.DatetimeIndex
-    lb_pvalue: Optional[float] = None
 
 
-# =========================
-# Helpers
-# =========================
-
-def mase_insample(
-    y_train: np.ndarray,
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    m: int = 12,
-) -> float:
-    y_train = np.asarray(y_train, dtype="float64")
-    y_true = np.asarray(y_true, dtype="float64")
-    y_pred = np.asarray(y_pred, dtype="float64")
-
-    mask = ~np.isnan(y_true) & ~np.isnan(y_pred)
-    y_true = y_true[mask]
-    y_pred = y_pred[mask]
-    if y_true.size == 0:
-        return float("nan")
-    
-    mae = np.mean(np.abs(y_true - y_pred))
-
-    ins = y_train[~np.isnan(y_train)]
-    if ins.size <= m:
-        if len(ins) > 1:
-            denom = np.mean(np.abs(np.diff(ins)))
-        else:
-            denom = 0.0
-    else:
-        denom = np.mean(np.abs(ins[m:] - ins[:-m]))
-
-    if not math.isfinite(denom) or denom == 0.0:
-        return float("nan")
-
-    return float(mae / denom)
+def _seasonal_naive_forecast(
+    y: pd.Series, horizon: int, seasonal_period: int
+) -> np.ndarray:
+    if len(y) < seasonal_period:
+        return np.repeat(y.iloc[-1], horizon)
+    history = y.values
+    out = []
+    for h in range(horizon):
+        out.append(history[-seasonal_period + (h % seasonal_period)])
+    return np.array(out)
 
 
-def smape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    y_true = np.asarray(y_true, dtype="float64")
-    y_pred = np.asarray(y_pred, dtype="float64")
-    mask = ~np.isnan(y_true) & ~np.isnan(y_pred)
-    y_true = y_true[mask]
-    y_pred = y_pred[mask]
-    if len(y_true) == 0:
-        return float("nan")
-    denom = (np.abs(y_true) + np.abs(y_pred))
-    denom[denom == 0] = np.nan
-    val = 2.0 * np.abs(y_pred - y_true) / denom
-    return float(np.nanmean(val) * 100.0)
+def _walk_forward_backtest(
+    y: pd.Series,
+    exog: Optional[pd.DataFrame],
+    freq: Frequency,
+    horizons: List[int],
+) -> Dict[int, Dict[str, FamilyResult]]:
+    """
+    {horizon: {family: FamilyResult}}
+    families: SeasonalNaive, ARIMA, SARIMA, SARIMAX, RF, GB
+    """
+    res: Dict[int, Dict[str, FamilyResult]] = {h: {} for h in horizons}
+    y = y.dropna()
+    if len(y) < 40:
+        return res
 
-
-def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    y_true = np.asarray(y_true, dtype="float64")
-    y_pred = np.asarray(y_pred, dtype="float64")
-    mask = ~np.isnan(y_true) & ~np.isnan(y_pred)
-    y_true = y_true[mask]
-    y_pred = y_pred[mask]
-    if len(y_true) == 0:
-        return float("nan")
-    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
-
-
-def _to_py(obj: Any) -> Any:
-    if isinstance(obj, np.generic):
-        val = obj.item()
-        if isinstance(val, float) and not math.isfinite(val):
-            return None
-        return val
-    if isinstance(obj, float):
-        return obj if math.isfinite(obj) else None
-    if isinstance(obj, dict):
-        return {k: _to_py(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [_to_py(v) for v in obj]
-    return obj
-
-
-def _safe_num(x: Any) -> Optional[float]:
-    if x is None: return None
-    try:
-        val = float(x)
-        return val if math.isfinite(val) else None
-    except:
-        return None
-
-
-# =========================
-# Data Prep
-# =========================
-
-def _build_dataframe(req: ExperimentRequest) -> pd.DataFrame:
-    idx = pd.to_datetime(req.dates)
-    data = {}
-    for s in req.series:
-        data[s.name] = pd.Series(s.values, index=idx, dtype="float64")
-    return pd.DataFrame(data).sort_index()
-
-
-def _impute(df: pd.DataFrame, method: Imputation) -> pd.DataFrame:
-    if method == "ffill": return df.ffill()
-    if method == "bfill": return df.bfill()
-    if method == "interp": return df.interpolate(limit_direction="both")
-    return df
-
-
-def _align_to_monthly(df: pd.DataFrame, freq: Frequency) -> pd.DataFrame:
     if freq == "M":
-        return df.asfreq("MS")
-    return df.resample("MS").ffill()
-
-
-# =========================
-# Diagnostics
-# =========================
-
-def _series_diagnostics(y: pd.Series, freq: Frequency) -> Dict[str, Any]:
-    s = y.dropna()
-    if len(s) < 10:
-        return {"mean": 0, "std": 0, "transform": "none", "has_seasonality": False}
-
-    try:
-        adf_res = adfuller(s, autolag="AIC")
-        adf_p = float(adf_res[1])
-    except:
-        adf_p = 1.0
-
-    has_seasonality = False
-    r12 = 0.0
-    if freq == "M" and len(s) > 24:
-        r12 = float(s.autocorr(12))
-        has_seasonality = abs(r12) > 0.4
-
-    transform = "none"
-    if (s > 0).all():
-        if (s.max() / max(s.min(), 1e-9) > 2.0):
-            transform = "log"
-
-    return {
-        "mean": float(s.mean()),
-        "std": float(s.std()),
-        "adf_p": adf_p,
-        "acf_12": r12,
-        "has_seasonality": has_seasonality,
-        "transform": transform,
-    }
-
-
-def _make_stationary_series(y: pd.Series, diag: Dict[str, Any]) -> pd.Series:
-    s = y.astype("float64").copy()
-    if diag.get("transform") == "log":
-        s = s.where(s > 0)
-        s = np.log(s)
-    s = s.diff()
-    return s
-
-
-def _compute_correlations(df: pd.DataFrame, max_lag: int) -> Tuple[Any, Any]:
-    lag_edges = []
-    cols = list(df.columns)
-    
-    for i, a in enumerate(cols):
-        for j, b in enumerate(cols):
-            if i == j: continue
-            s1 = df[a]
-            s2 = df[b]
-            
-            best_r, best_p, best_lag = 0.0, 1.0, 0
-            
-            search_lag = min(max_lag, 6)
-            for lag in range(-search_lag, search_lag + 1):
-                if lag < 0:
-                    x, y_ = s1.shift(-lag), s2
-                else:
-                    x, y_ = s1, s2.shift(lag)
-                
-                mask = ~x.isna() & ~y_.isna()
-                if mask.sum() < 10: continue
-                
-                r, p = stats.pearsonr(x[mask], y_[mask])
-                if abs(r) > abs(best_r):
-                    best_r, best_p, best_lag = r, p, lag
-            
-            lag_edges.append({
-                "source": a, "target": b,
-                "best_lag": best_lag,
-                "r_at_best_lag": best_r,
-                "p_value": best_p
-            })
-
-    return {}, lag_edges
-
-
-def _select_base_variables(df: pd.DataFrame, roles: Dict, edges: List, max_lag: int):
-    targets = [n for n, r in roles.items() if r == "target"]
-    candidates = [n for n, r in roles.items() if r == "candidate"]
-    
-    strong = set()
-    for e in edges:
-        if e["target"] in targets and e["source"] in candidates:
-            if abs(e["r_at_best_lag"]) > 0.3 and e["p_value"] < 0.05:
-                strong.add(e["source"])
-    
-    if not strong:
-        strong = set(candidates)
-        
-    selected = list(strong)
-    vifs = {c: 1.0 for c in selected}
-    
-    return selected, {"base_variables": selected, "vif": vifs}
-
-
-def _train_val_split(y: pd.Series, horizon: int) -> Tuple[pd.Series, pd.Series]:
-    if len(y) <= horizon + 5:
-        split = int(len(y) * 0.8)
-        return y.iloc[:split], y.iloc[split:]
-    return y.iloc[:-horizon], y.iloc[-horizon:]
-
-
-# =========================
-# 1. ML Model (Pure GBR)
-# =========================
-
-def _fit_gb_regressor(
-    name: str, y: pd.Series, exog: Optional[pd.DataFrame], exog_future: Optional[pd.DataFrame],
-    horizon: int, max_lag: int, diag: Dict[str, Any]
-) -> Optional[ModelCandidate]:
-    
-    use_log = (diag.get("transform") == "log")
-    y_proc = np.log(y.where(y > 0, 1e-9)) if use_log else y.copy()
-    y_diff = y_proc.diff().dropna()
-    
-    if len(y_diff) < 12: return None
-    
-    p = min(max_lag, 6)
-    df = pd.DataFrame({"target": y_diff})
-    for lag in range(1, p + 1):
-        df[f"lag_{lag}"] = df["target"].shift(lag)
-        
-    exog_cols = []
-    if exog is not None:
-        # Safe alignment and fillna
-        exog_aligned = exog.reindex(y_diff.index).ffill().bfill()
-        for col in exog.columns:
-            df[col] = exog_aligned[col]
-            exog_cols.append(col)
-            
-    df = df.dropna()
-    if len(df) < 12: return None
-    
-    y_all = df["target"]
-    X_all = df.drop(columns=["target"])
-    y_train, y_test = _train_val_split(y_all, horizon)
-    split_idx = len(y_train)
-    X_train = X_all.iloc[:split_idx]
-    X_test = X_all.iloc[split_idx:]
-    
-    model = GradientBoostingRegressor(random_state=42, n_estimators=100, max_depth=2, learning_rate=0.05)
-    
-    st = time.perf_counter()
-    model.fit(X_train.values, y_train.values)
-    fit_time = time.perf_counter() - st
-    
-    st_p = time.perf_counter()
-    pred_diff_test = model.predict(X_test.values)
-    
-    # Reconstruct Test
-    test_indices = y_test.index
-    prev_vals_proc = y_proc.shift(1).loc[test_indices]
-    pred_test_proc = prev_vals_proc.values + pred_diff_test
-    pred_test_abs = np.exp(pred_test_proc) if use_log else pred_test_proc
-    
-    # Future
-    last_proc_val = y_proc.iloc[-1]
-    current_lags = list(y_diff.values[-p:])
-    future_abs = []
-    curr_val = last_proc_val
-    
-    for h in range(horizon):
-        lag_feats = np.array(current_lags[-p:][::-1])
-        exog_feats = []
-        if exog_future is not None and exog_cols:
-            if h < len(exog_future):
-                # SAFE EXOG ACCESS
-                exog_feats = list(exog_future.iloc[h][exog_cols].fillna(0.0).values)
-            else:
-                exog_feats = [0.0]*len(exog_cols)
-        elif exog_cols:
-             exog_feats = [0.0]*len(exog_cols)
-        
-        full_feats = np.concatenate([lag_feats, exog_feats]).reshape(1, -1)
-        # SANITIZE INPUT
-        full_feats = np.nan_to_num(full_feats)
-        
-        pred_d = float(model.predict(full_feats)[0])
-        curr_val += pred_d
-        future_abs.append(np.exp(curr_val) if use_log else curr_val)
-        current_lags.append(pred_d)
-        
-    pred_time = time.perf_counter() - st_p
-    future_arr = np.array(future_abs)
-    
-    y_test_abs_true = y.loc[test_indices].values
-    y_train_abs_true = y.iloc[:split_idx].values
-    
-    err_mase = mase_insample(y_train_abs_true, y_test_abs_true, pred_test_abs, m=12)
-    err_smape = smape(y_test_abs_true, pred_test_abs)
-    err_rmse = rmse(y_test_abs_true, pred_test_abs)
-
-    dates_train = y_all.index[:split_idx]
-    prev_vals_train = y_proc.shift(1).loc[dates_train]
-    
-    # Reconstruct Train with safety
-    raw_pred_train = model.predict(X_train.values)
-    pred_train_proc = prev_vals_train.values + raw_pred_train
-    # Fill NaN at start
-    pred_train_proc = np.nan_to_num(pred_train_proc, nan=prev_vals_train.values[0] if len(prev_vals_train)>0 else 0)
-    
-    pred_train_abs = np.exp(pred_train_proc) if use_log else pred_train_proc
-    
-    dates_test = y_all.index[split_idx:]
-    future_index = pd.date_range(start=y.index[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
-
-    return ModelCandidate(
-        series_name=name, model_type="GBR", reason="ML (Gradient Boosting)",
-        mase=err_mase, smape=err_smape, rmse=err_rmse,
-        fit_time=fit_time, pred_time=pred_time, params={"lags": p},
-        y_pred_train=pred_train_abs, y_pred_test=pred_test_abs, y_pred_future=future_arr,
-        dates_train=dates_train, dates_test=dates_test, dates_future=future_index
-    )
-
-
-# =========================
-# 2. ARIMA Models
-# =========================
-
-def _fit_sarimax(
-    name: str, y: pd.Series, exog: Optional[pd.DataFrame], exog_future: Optional[pd.DataFrame],
-    horizon: int, has_seasonality: bool,
-) -> Optional[ModelCandidate]:
-    train, test = _train_val_split(y, horizon)
-    
-    ex_train = exog.loc[train.index] if exog is not None else None
-    ex_test = exog.loc[test.index] if exog is not None else None
-    ex_fut = exog_future if exog_future is not None else None
-
-    order = (1, 1, 1)
-    seasonal = (1, 1, 0, 12) if has_seasonality else (0, 0, 0, 0)
-    reason = "SARIMAX" if exog is not None else ("SARIMA" if has_seasonality else "ARIMA")
-
-    try:
-        st = time.perf_counter()
-        model = sm.tsa.statespace.SARIMAX(
-            train, order=order, seasonal_order=seasonal, exog=ex_train,
-            enforce_stationarity=False, enforce_invertibility=False
-        )
-        res = model.fit(disp=False)
-        fit_time = time.perf_counter() - st
-    except:
-        return None
-
-    st_p = time.perf_counter()
-    try:
-        pred_test = res.get_forecast(steps=len(test), exog=ex_test).predicted_mean
-    except:
-        pred_test = pd.Series([train.iloc[-1]]*len(test), index=test.index)
-
-    try:
-        if ex_fut is not None and len(ex_fut) != horizon: ex_fut = ex_fut.iloc[:horizon]
-        pred_future = res.get_forecast(steps=horizon, exog=ex_fut).predicted_mean
-    except:
-         pred_future = pd.Series([train.iloc[-1]]*horizon)
-
-    pred_time = time.perf_counter() - st_p
-
-    err_mase = mase_insample(train.values, test.values, pred_test.values, m=12)
-    err_smape = smape(test.values, pred_test.values)
-    err_rmse = rmse(test.values, pred_test.values)
-    
-    try:
-        lb_p = float(acorr_ljungbox(res.resid.dropna(), lags=[10])["lb_pvalue"].iloc[0])
-    except:
-        lb_p = None
-
-    future_index = pd.date_range(start=y.index[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
-
-    return ModelCandidate(
-        series_name=name, model_type=reason, reason=reason,
-        mase=err_mase, smape=err_smape, rmse=err_rmse,
-        fit_time=fit_time, pred_time=pred_time, params={"order": order},
-        y_pred_train=res.fittedvalues.reindex(train.index).values,
-        y_pred_test=pred_test.values, y_pred_future=pred_future.values,
-        dates_train=train.index, dates_test=test.index, dates_future=future_index, lb_pvalue=lb_p
-    )
-
-
-def _fit_seasonal_naive(name: str, y: pd.Series, horizon: int, m: int) -> ModelCandidate:
-    train, test = _train_val_split(y, horizon)
-    y_train = train.values
-    y_test = test.values
-    
-    if len(train) > m:
-        pred_test = np.tile(y_train[-m:], int(np.ceil(len(test)/m)))[:len(test)]
-        future = np.tile(y_train[-m:], int(np.ceil(horizon/m)))[:horizon]
+        season = 12
+    elif freq == "Q":
+        season = 4
     else:
-        pred_test = np.full(len(test), y_train[-1])
-        future = np.full(horizon, y_train[-1])
-        
-    err_mase = mase_insample(y_train, y_test, pred_test, m=m)
-    err_smape = smape(y_test, pred_test)
-    err_rmse = rmse(y_test, pred_test)
-    future_index = pd.date_range(start=y.index[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
+        season = 1
 
-    return ModelCandidate(
-        series_name=name, model_type="SeasonalNaive", reason="Benchmark",
-        mase=err_mase, smape=err_smape, rmse=err_rmse,
-        fit_time=0, pred_time=0, params={},
-        y_pred_train=np.full(len(train), np.nan), y_pred_test=pred_test, y_pred_future=future,
-        dates_train=train.index, dates_test=test.index, dates_future=future_index
-    )
+    n = len(y)
+    split_idx = int(n * 0.7)
+    if split_idx + max(horizons) + 5 >= n:
+        split_idx = n - max(horizons) - 5
 
+    y_train_full = y.iloc[:split_idx]
+    y_test_full = y.iloc[split_idx:]
 
-# =========================
-# 3. Hybrid Model (SARIMA + ML Residuals) - SILVER BULLET
-# =========================
+    if exog is not None:
+        exog = exog.loc[y.index]
+    y_insample = y_train_full.values
 
-def _fit_hybrid_model(
-    name: str, y: pd.Series, exog: Optional[pd.DataFrame], exog_future: Optional[pd.DataFrame],
-    horizon: int, max_lag: int, diag: Dict[str, Any]
-) -> Optional[ModelCandidate]:
-    
-    # 1. Fit Linear Base (SARIMA)
-    has_seasonality = diag.get("has_seasonality", False)
-    sarima_cand = _fit_sarimax(name, y, None, None, horizon, has_seasonality)
-    if sarima_cand is None: return None
-    
-    # Get residuals (errors of ARIMA)
-    train, test = _train_val_split(y, horizon)
-    
-    # Resid calculation: fill NaNs with 0
-    resid_train = train.values - sarima_cand.y_pred_train
-    resid_train = np.nan_to_num(resid_train)
-    resid_series = pd.Series(resid_train, index=train.index)
-    
-    # 2. Fit GBR on Residuals
-    exog_train = exog.loc[train.index] if exog is not None else None
-    
-    p = min(max_lag, 6)
-    df = pd.DataFrame({"target": resid_series})
-    for lag in range(1, p + 1):
-        df[f"lag_{lag}"] = df["target"].shift(lag)
-    
-    exog_cols = []
-    if exog_train is not None:
-        aligned = exog_train.reindex(resid_series.index).ffill().bfill()
-        for col in exog_train.columns:
-            df[col] = aligned[col]
-            exog_cols.append(col)
-            
-    df = df.dropna()
-    if len(df) < 12: 
-        sarima_cand.model_type = "Hybrid (Linear Only)"
-        return sarima_cand
-        
-    y_gb = df["target"]
-    X_gb = df.drop(columns=["target"])
-    
-    gb_model = GradientBoostingRegressor(random_state=42, n_estimators=50, max_depth=2)
-    
-    st = time.perf_counter()
-    gb_model.fit(X_gb.values, y_gb.values)
-    ft = time.perf_counter() - st
-    
-    # 3. Forecast Residuals
-    curr_lags = list(resid_series.values[-p:])
-    resid_pred_test = []
-    
-    # A. Test Forecast
-    exog_test = exog.loc[test.index] if exog is not None else None
-    
-    for h in range(len(test)):
-        lag_f = np.array(curr_lags[-p:][::-1])
-        ex_f = []
-        if exog_test is not None:
-             ex_f = list(exog_test.iloc[h].fillna(0.0).values)
-        else:
-             ex_f = [0.0]*len(exog_cols)
-             
-        full_f = np.concatenate([lag_f, ex_f]).reshape(1, -1)
-        full_f = np.nan_to_num(full_f)
-        
-        pred = float(gb_model.predict(full_f)[0])
-        resid_pred_test.append(pred)
-        curr_lags.append(pred)
-        
-    # B. Future Forecast
-    resid_pred_fut = []
-    for h in range(horizon):
-        lag_f = np.array(curr_lags[-p:][::-1])
-        ex_f = []
-        if exog_future is not None and exog_cols:
-            if h < len(exog_future):
-                 ex_f = list(exog_future.iloc[h][exog_cols].fillna(0.0).values)
+    for h in horizons:
+        fam_err: Dict[str, Dict[str, List[float]]] = {
+            "SeasonalNaive": {"y": [], "yhat": []},
+            "ARIMA": {"y": [], "yhat": []},
+            "SARIMA": {"y": [], "yhat": []},
+            "SARIMAX": {"y": [], "yhat": []},
+            "RF": {"y": [], "yhat": []},
+            "GB": {"y": [], "yhat": []},
+        }
+        fam_fit_time: Dict[str, float] = {k: 0.0 for k in fam_err}
+        fam_pred_time: Dict[str, float] = {k: 0.0 for k in fam_err}
+
+        max_steps = min(5, len(y_test_full) - h)
+        if max_steps <= 0:
+            continue
+
+        for step in range(max_steps):
+            end_train = split_idx + step
+            start_test = end_train
+            end_test = end_train + h
+
+            y_train = y.iloc[:end_train]
+            y_test = y.iloc[start_test:end_test]
+
+            if exog is not None:
+                exog_train = exog.iloc[:end_train]
+                exog_test = exog.iloc[start_test:end_test]
             else:
-                 ex_f = [0.0]*len(exog_cols)
-        elif exog_cols:
-             ex_f = [0.0]*len(exog_cols)
+                exog_train = None
+                exog_test = None
 
-        full_f = np.concatenate([lag_f, ex_f]).reshape(1, -1)
-        full_f = np.nan_to_num(full_f)
-        
-        pred = float(gb_model.predict(full_f)[0])
-        resid_pred_fut.append(pred)
-        curr_lags.append(pred)
-        
-    # 4. Combine
-    final_pred_test = sarima_cand.y_pred_test + np.array(resid_pred_test)
-    final_pred_fut = sarima_cand.y_pred_future + np.array(resid_pred_fut)
-    
-    # 5. Metrics
-    err_mase = mase_insample(train.values, test.values, final_pred_test, m=12)
-    err_smape = smape(test.values, final_pred_test)
-    err_rmse = rmse(test.values, final_pred_test)
-    
-    return ModelCandidate(
-        series_name=name, model_type="Hybrid (SARIMA+GBR)", 
-        reason="Hybrid: Linear Trend + ML Residuals (Wage)",
-        mase=err_mase, smape=err_smape, rmse=err_rmse,
-        fit_time=sarima_cand.fit_time + ft, 
-        pred_time=sarima_cand.pred_time, # approx
-        params={"linear": sarima_cand.params},
-        y_pred_train=sarima_cand.y_pred_train,
-        y_pred_test=final_pred_test,
-        y_pred_future=final_pred_fut,
-        dates_train=sarima_cand.dates_train,
-        dates_test=sarima_cand.dates_test,
-        dates_future=sarima_cand.dates_future,
-        lb_pvalue=sarima_cand.lb_pvalue
-    )
+            # SeasonalNaive
+            t0 = time.time()
+            yhat_sn = _seasonal_naive_forecast(y_train, h, season)
+            fam_fit_time["SeasonalNaive"] += time.time() - t0
+            fam_pred_time["SeasonalNaive"] += 0.0
+            fam_err["SeasonalNaive"]["y"].extend(y_test.values.tolist())
+            fam_err["SeasonalNaive"]["yhat"].extend(yhat_sn.tolist())
+
+            # ARIMA
+            try:
+                t0 = time.time()
+                arima_model = SARIMAX(
+                    y_train,
+                    order=(1, 1, 1),
+                    seasonal_order=(0, 0, 0, 0),
+                    exog=exog_train,
+                    enforce_stationarity=False,
+                    enforce_invertibility=False,
+                ).fit(disp=False)
+                fam_fit_time["ARIMA"] += time.time() - t0
+
+                t1 = time.time()
+                yhat_arima = arima_model.forecast(steps=h, exog=exog_test)
+                fam_pred_time["ARIMA"] += time.time() - t1
+                fam_err["ARIMA"]["y"].extend(y_test.values.tolist())
+                fam_err["ARIMA"]["yhat"].extend(yhat_arima.tolist())
+            except Exception:
+                pass
+
+            # SARIMA
+            try:
+                t0 = time.time()
+                sarima_model = SARIMAX(
+                    y_train,
+                    order=(1, 1, 1),
+                    seasonal_order=(1, 1, 1, season),
+                    enforce_stationarity=False,
+                    enforce_invertibility=False,
+                ).fit(disp=False)
+                fam_fit_time["SARIMA"] += time.time() - t0
+
+                t1 = time.time()
+                yhat_sarima = sarima_model.forecast(steps=h)
+                fam_pred_time["SARIMA"] += time.time() - t1
+                fam_err["SARIMA"]["y"].extend(y_test.values.tolist())
+                fam_err["SARIMA"]["yhat"].extend(yhat_sarima.tolist())
+            except Exception:
+                pass
+
+            # SARIMAX
+            if exog_train is not None:
+                try:
+                    t0 = time.time()
+                    sarimax_model = SARIMAX(
+                        y_train,
+                        order=(1, 1, 1),
+                        seasonal_order=(1, 1, 1, season),
+                        exog=exog_train,
+                        enforce_stationarity=False,
+                        enforce_invertibility=False,
+                    ).fit(disp=False)
+                    fam_fit_time["SARIMAX"] += time.time() - t0
+
+                    t1 = time.time()
+                    yhat_sarimax = sarimax_model.forecast(steps=h, exog=exog_test)
+                    fam_pred_time["SARIMAX"] += time.time() - t1
+                    fam_err["SARIMAX"]["y"].extend(y_test.values.tolist())
+                    fam_err["SARIMAX"]["yhat"].extend(yhat_sarimax.tolist())
+                except Exception:
+                    pass
+
+            # RF / GB на лагових ознаках
+            max_lag_rf = min(12, len(y_train) - 1)
+            if max_lag_rf <= 0:
+                continue
+
+            lagged: Dict[str, pd.Series] = {}
+            for l in range(1, max_lag_rf + 1):
+                lagged[f"lag_{l}"] = y.shift(l)
+
+            X_all = pd.DataFrame(lagged, index=y.index)
+            if exog is not None:
+                X_all = pd.concat([X_all, exog], axis=1)
+
+            # тренувальна частина: до end_train, потім дропаємо NaN
+            X_train = X_all.iloc[:end_train].dropna()
+            y_train_rf = y.loc[X_train.index]
+
+            X_test = X_all.iloc[start_test:end_test]
+            if X_test.isna().any().any() or X_test.empty:
+                continue
+
+            y_test_rf = y.iloc[start_test:end_test]
+
+            # RF
+            try:
+                t0 = time.time()
+                rf = RandomForestRegressor(
+                    n_estimators=200,
+                    max_depth=5,
+                    random_state=0,
+                )
+                rf.fit(X_train, y_train_rf)
+                fam_fit_time["RF"] += time.time() - t0
+
+                t1 = time.time()
+                yhat_rf = rf.predict(X_test)
+                fam_pred_time["RF"] += time.time() - t1
+
+                fam_err["RF"]["y"].extend(y_test_rf.values.tolist())
+                fam_err["RF"]["yhat"].extend(yhat_rf.tolist())
+            except Exception:
+                pass
+
+            # GB
+            try:
+                t0 = time.time()
+                gb = GradientBoostingRegressor(
+                    n_estimators=200,
+                    max_depth=3,
+                    learning_rate=0.05,
+                    random_state=0,
+                )
+                gb.fit(X_train, y_train_rf)
+                fam_fit_time["GB"] += time.time() - t0
+
+                t1 = time.time()
+                yhat_gb = gb.predict(X_test)
+                fam_pred_time["GB"] += time.time() - t1
+
+                fam_err["GB"]["y"].extend(y_test_rf.values.tolist())
+                fam_err["GB"]["yhat"].extend(yhat_gb.tolist())
+            except Exception:
+                pass
+
+        # агрегація метрик
+        for fam, store in fam_err.items():
+            if len(store["y"]) == 0:
+                continue
+            y_true = np.asarray(store["y"])
+            y_hat = np.asarray(store["yhat"])
+            mse = mean_squared_error(y_true, y_hat)
+            rmse_val = float(math.sqrt(mse))
+            mase_val = mase(y_true, y_hat, y_insample, m=season)
+            smape_val = smape(y_true, y_hat)
+
+            res[h][fam] = FamilyResult(
+                mase=mase_val,
+                smape=smape_val,
+                rmse=rmse_val,
+                fit_time=fam_fit_time[fam],
+                pred_time=fam_pred_time[fam],
+            )
+
+    return res
 
 
 # =========================
-# Selection Logic
-# =========================
-
-def _select_model(
-    name: str, y: pd.Series, 
-    exog: Optional[pd.DataFrame], exog_fut: Optional[pd.DataFrame],
-    diag: Dict, horizon: int, max_lag: int, allow_gbr: bool
-):
-    candidates = []
-    
-    # 1. Base Benchmarks
-    candidates.append(_fit_seasonal_naive(name, y, horizon, 12))
-    
-    # 2. Linear
-    arima = _fit_sarimax(name, y, None, None, horizon, False)
-    if arima: candidates.append(arima)
-    
-    if diag["has_seasonality"]:
-        sarima = _fit_sarimax(name, y, None, None, horizon, True)
-        if sarima: candidates.append(sarima)
-        
-    # 3. Pure ML
-    if allow_gbr:
-        gbr = _fit_gb_regressor(name, y, exog, exog_fut, horizon, max_lag, diag)
-        if gbr: candidates.append(gbr)
-        
-    # 4. Hybrid (Silver Bullet) - Only if exog exists (Wage)
-    if allow_gbr and exog is not None:
-        hybrid = _fit_hybrid_model(name, y, exog, exog_fut, horizon, max_lag, diag)
-        if hybrid: candidates.append(hybrid)
-
-    valid = [m for m in candidates if m is not None and m.mase is not None]
-    if not valid: return candidates, None
-    
-    best = min(valid, key=lambda x: x.mase)
-    return valid, best
-
-
-def _compare_horizons(
-    name: str, y: pd.Series, exog: pd.DataFrame, max_lag: int, allow_gbr: bool, diag: Dict
-):
-    series = y.dropna()
-    results = {}
-    
-    # Змінюємо набір горизонтів для тестування довгострокової точності
-    for H in [1, 3, 6, 12]: 
-        exog_curr = exog.reindex(series.index) if exog is not None else None
-        exog_fut_slice = exog_curr.iloc[-H:] if exog_curr is not None else None
-        
-        res_h = {}
-        
-        m_arima = _fit_sarimax(name, series, None, None, H, False)
-        if m_arima: res_h["ARIMA"] = _extract_metrics(m_arima)
-        
-        m_sarima = _fit_sarimax(name, series, None, None, H, True)
-        if m_sarima: res_h["SARIMA"] = _extract_metrics(m_sarima)
-        
-        if exog_curr is not None:
-             m_sarimax = _fit_sarimax(name, series, exog_curr, exog_fut_slice, H, diag["has_seasonality"])
-             if m_sarimax: res_h["SARIMAX"] = _extract_metrics(m_sarimax)
-             
-        if allow_gbr and exog_curr is not None:
-             # Try Hybrid in comparison
-             m_hyb = _fit_hybrid_model(name, series, exog_curr, exog_fut_slice, H, max_lag, diag)
-             if m_hyb: res_h["Hybrid"] = _extract_metrics(m_hyb)
-             
-             # Try Pure GB
-             m_gb = _fit_gb_regressor(name, series, exog_curr, exog_fut_slice, H, max_lag, diag)
-             if m_gb: res_h["GB"] = _extract_metrics(m_gb)
-
-        if res_h: results[H] = res_h
-        
-    return results
-
-def _extract_metrics(m: ModelCandidate):
-    return {
-        "mase": m.mase, "smape": m.smape, "rmse": m.rmse,
-        "fit_time": m.fit_time, "pred_time": m.pred_time
-    }
-
-
-# =========================
-# Main Run
+# 6–7. Повний експеримент
 # =========================
 
 def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
-    df_raw = _build_dataframe(req)
-    df = _align_to_monthly(df_raw, req.frequency)
-    df = _impute(df, req.imputation)
+    df_raw, meta = _build_dataframe(req)
+    df_imp = _impute_df(df_raw, req.imputation)
+
+    targets = [s.name for s in req.series if s.role == "target"]
+    candidates = [s.name for s in req.series if s.role == "candidate"]
+    ignored = [s.name for s in req.series if s.role == "ignored"]
+
+    # 1–2. Діагностика + стаціонаризація
+    df_st, trans_info = _make_stationary(df_imp, req.frequency)
+    series_diag = _compute_series_diagnostics(df_imp, req.frequency, trans_info)
+
+    # 3. Кореляції й базові змінні
+    correlations = _compute_correlations(df_st, targets, candidates)
+    base_vars = _select_base_variables(correlations, threshold=0.3)
+    vif = _compute_vif(df_imp, base_vars) if base_vars else {}
+
+    factors = {"vif": vif}
+
+    # 5. Walk-forward backtest для порівняння сімейств (але НЕ для вибору класу)
+    horizons = [1, 2, 3]
+    comparison: Dict[str, Any] = {}
+    models: List[ModelInfo] = []
+    targets_diag: Dict[str, Any] = {}
+    targets_exog: Dict[str, Any] = {}
+    forecasts: List[ForecastPoint] = []
+    selection_info: Dict[str, Any] = {}  # для пояснення вибору на ЮІ
+
+    for t in targets:
+        # --- Визначаємо exog для таргету ---
+        exog_cols = [b for b in base_vars if b != t]
+        exog_df = df_imp[exog_cols] if exog_cols else None
+        has_exog = bool(exog_cols)
+
+        # --- Беремо діагностику ряду ---
+        s_info = series_diag.get(t, {})
+        has_seasonality = bool(s_info.get("has_seasonality", False))
+        is_nonlinear = bool(s_info.get("is_nonlinear", False))
+
+        # --- Backtest для всіх сімейств (для порівняння й метрик) ---
+        fam_results = _walk_forward_backtest(
+            y=df_imp[t],
+            exog=exog_df,
+            freq=req.frequency,
+            horizons=horizons,
+        )
+
+        comparison[t] = {}
+        for h in horizons:
+            comparison[t][h] = {}
+            for fam, fr in fam_results.get(h, {}).items():
+                comparison[t][h][fam] = {
+                    "mase": fr.mase,
+                    "smape": fr.smape,
+                    "rmse": fr.rmse,
+                    "fit_time": fr.fit_time,
+                    "pred_time": fr.pred_time,
+                }
+
+        # --- 4. Середні MASE по сімействам (для override) ---
+        avg_mase: Dict[str, float] = {}
+        for fam in ["SeasonalNaive", "ARIMA", "SARIMA", "SARIMAX", "RF", "GB"]:
+            vals = []
+            for h in horizons:
+                fr = fam_results.get(h, {}).get(fam)
+                if fr is not None and not math.isinf(fr.mase):
+                    vals.append(fr.mase)
+            if vals:
+                avg_mase[fam] = float(np.mean(vals))
+
+        # --- 5. RULE-BASED вибір (як було) ---
+        # 5.1. За замовчуванням – ARIMA-сімейство
+        chosen_family = "ARIMA"
+        chosen_rule = "linear_arima"  # для ЮІ
+
+        if is_nonlinear:
+            # Клас дерев рішень. Конкретну модель беремо за MASE з backtest.
+            tree_candidates: Dict[str, float] = {}
+            for fam in ["RF", "GB"]:
+                if fam in avg_mase:
+                    tree_candidates[fam] = avg_mase[fam]
+
+            if tree_candidates:
+                chosen_family = min(tree_candidates.items(), key=lambda kv: kv[1])[0]
+                chosen_rule = "nonlinear_trees"
+            else:
+                # якщо дерева чомусь не порахувались – падаємо назад у лінійну гілку нижче
+                is_nonlinear = False  # щоб спрацювали лінійні правила
+
+        # Лінійна динаміка / fallback
+        if not is_nonlinear:
+            if has_exog:
+                chosen_family = "SARIMAX"
+                chosen_rule = "linear_with_exog_sarimax"
+            elif has_seasonality:
+                chosen_family = "SARIMA"
+                chosen_rule = "linear_seasonal_sarima"
+            else:
+                chosen_family = "ARIMA"
+                chosen_rule = "linear_arima"
+
+        # --- 6. Якщо для chosen_family немає жодного результату backtest ---
+        if not any(fam_results.get(h, {}).get(chosen_family) is not None for h in horizons):
+            if avg_mase:
+                # fallback: будь-яке сімейство з мінімальним середнім MASE
+                chosen_family = min(avg_mase.items(), key=lambda kv: kv[1])[0]
+                chosen_rule = "fallback_best_mase"
+
+        # --- 7. OVERRIDE: якщо backtest явно каже, що інше сімейство кращe ---
+        if avg_mase:
+            chosen_mase = avg_mase.get(chosen_family, float("inf"))
+            best_fam, best_mase_val = min(avg_mase.items(), key=lambda kv: kv[1])
+
+            # якщо хтось кращий за поточного хоча б на 20%
+            if math.isfinite(chosen_mase) and best_mase_val < chosen_mase * 0.8:
+                chosen_family = best_fam
+                if best_fam in ["RF", "GB"]:
+                    chosen_rule = "override_backtest_trees"
+                    is_nonlinear = True  # щоб у діагностиці відображалось чесно
+                else:
+                    chosen_rule = "override_backtest_linear"
+
+        # --- 8. Зберігаємо інфу для ЮІ (чому так) ---
+        selection_info[t] = {
+            "has_exog": has_exog,
+            "has_seasonality": has_seasonality,
+            "is_nonlinear": is_nonlinear,
+            "chosen_family": chosen_family,
+            "rule": chosen_rule,
+        }
+
+        # СИНХРОНІЗУЄМО діагностику для таблиці 1:
+        if chosen_family in ["RF", "GB"]:
+            if t in series_diag:
+                series_diag[t]["is_nonlinear"] = True
+
     
-    roles = {s.name: s.role for s in req.series}
-    targets = [n for n, r in roles.items() if r == "target"]
-    
-    diags = {"series": {}}
-    for c in df.columns:
-        diags["series"][c] = _series_diagnostics(df[c], req.frequency)
-        
-    diags["meta"] = {
-        "start": df.index.min().strftime("%Y-%m-%d"),
-        "end": df.index.max().strftime("%Y-%m-%d"),
-        "n_rows": int(len(df))
+        # Перетворюємо chosen_family у modelType (як у БД)
+        if chosen_family == "GB":
+            model_type = "GBR"
+        else:
+            model_type = chosen_family
+
+        # Беремо середній MASE по горизонтах для вибраного сімейства (для таблиці 5)
+        mase_vals = []
+        for h in horizons:
+            fr = fam_results.get(h, {}).get(chosen_family)
+            if fr is not None and not math.isinf(fr.mase):
+                mase_vals.append(fr.mase)
+        best_mase = float(np.mean(mase_vals)) if mase_vals else float("inf")
+
+        fr_h1 = fam_results.get(1, {}).get(chosen_family)
+        smape_best = fr_h1.smape if fr_h1 else None
+        rmse_best = fr_h1.rmse if fr_h1 else None
+        fit_time_best = fr_h1.fit_time if fr_h1 else None
+        pred_time_best = fr_h1.pred_time if fr_h1 else None
+
+        models.append(
+            ModelInfo(
+                seriesName=t,
+                modelType=model_type,
+                mase=best_mase,
+                smape=smape_best,
+                rmse=rmse_best,
+                fit_time=fit_time_best,
+                pred_time=pred_time_best,
+                isSelected=True,
+            )
+        )
+
+        # --- 7. Фінальна модель + Ljung–Box + прогнози (як у тебе було) ---
+        y = df_imp[t].dropna()
+        n = len(y)
+        horizon = req.horizon
+
+        train_end = int(n * 0.8)
+        y_train = y.iloc[:train_end]
+        y_test = y.iloc[train_end:]
+
+        if exog_df is not None:
+            exog_all = exog_df.loc[y.index]
+            exog_train = exog_all.iloc[:train_end]
+            exog_test = exog_all.iloc[train_end:]
+            exog_future = exog_all.iloc[-horizon:]
+        else:
+            exog_all = None
+            exog_train = None
+            exog_test = None
+            exog_future = None
+
+        lb_pvalue = None
+        resid_ok = None
+
+        if model_type in ["ARIMA", "SARIMA", "SARIMAX"]:
+            if req.frequency == "M":
+                season = 12
+            elif req.frequency == "Q":
+                season = 4
+            else:
+                season = 1
+
+            if model_type == "ARIMA":
+                order = (1, 1, 1)
+                seas_order = (0, 0, 0, 0)
+            elif model_type == "SARIMA":
+                order = (1, 1, 1)
+                seas_order = (1, 1, 1, season)
+            else:  # SARIMAX
+                order = (1, 1, 1)
+                seas_order = (1, 1, 1, season)
+
+            try:
+                final_model = SARIMAX(
+                    y_train,
+                    order=order,
+                    seasonal_order=seas_order,
+                    exog=exog_train if model_type == "SARIMAX" else None,
+                    enforce_stationarity=False,
+                    enforce_invertibility=False,
+                ).fit(disp=False)
+
+                resid = final_model.resid
+                lb = acorr_ljungbox(resid.dropna(), lags=[min(10, len(resid) // 2)])
+                lb_pvalue = float(lb["lb_pvalue"].iloc[0])
+                resid_ok = bool(lb_pvalue > 0.05)
+            except Exception:
+                lb_pvalue = None
+                resid_ok = None
+
+        targets_diag[t] = {
+            "lb_pvalue": lb_pvalue,
+            "residuals_ok": resid_ok,
+        }
+
+        targets_exog[t] = []
+        if exog_cols:
+            for col in exog_cols:
+                targets_exog[t].append({"base": col, "lag": 0})
+
+        # Прогнози для ARIMA/SARIMA/SARIMAX (дерева як forecast на future можемо додати окремо)
+        if model_type in ["ARIMA", "SARIMA", "SARIMAX"]:
+            if req.frequency == "M":
+                s = 12
+            elif req.frequency == "Q":
+                s = 4
+            else:
+                s = 1
+            if model_type == "ARIMA":
+                order = (1, 1, 1)
+                seas_order = (0, 0, 0, 0)
+                ex_all = None
+            elif model_type == "SARIMA":
+                order = (1, 1, 1)
+                seas_order = (1, 1, 1, s)
+                ex_all = None
+            else:  # SARIMAX
+                order = (1, 1, 1)
+                seas_order = (1, 1, 1, s)
+                ex_all = exog_all if exog_all is not None else None
+
+            try:
+                final_model_all = SARIMAX(
+                    y,
+                    order=order,
+                    seasonal_order=seas_order,
+                    exog=ex_all,
+                    enforce_stationarity=False,
+                    enforce_invertibility=False,
+                ).fit(disp=False)
+
+                # backtest на тесті
+                if ex_all is not None and model_type == "SARIMAX":
+                    yhat_test = final_model_all.get_prediction(
+                        start=y_test.index[0], end=y_test.index[-1], exog=exog_test
+                    ).predicted_mean
+                else:
+                    yhat_test = final_model_all.get_prediction(
+                        start=y_test.index[0], end=y_test.index[-1]
+                    ).predicted_mean
+
+                for dt, y_true_val in y_test.items():
+                    y_pred_val = float(yhat_test.loc[dt]) if dt in yhat_test.index else None
+                    forecasts.append(
+                        ForecastPoint(
+                            seriesName=t,
+                            date=str(dt.date()),
+                            setType="test",
+                            valueActual=float(y_true_val),
+                            valuePred=y_pred_val,
+                        )
+                    )
+
+                # future
+                if ex_all is not None and model_type == "SARIMAX":
+                    yhat_future = final_model_all.forecast(steps=horizon, exog=exog_future)
+                else:
+                    yhat_future = final_model_all.forecast(steps=horizon)
+                if req.frequency == "M":
+                    freq_future = "ME"  # month-end
+                else:
+                    freq_future = req.frequency
+
+                future_idx = pd.date_range(
+                    start=y.index[-1] + (y.index[-1] - y.index[-2]),
+                    periods=horizon,
+                    freq=freq_future,
+                )
+                for dt, v in zip(future_idx, yhat_future):
+                    forecasts.append(
+                        ForecastPoint(
+                            seriesName=t,
+                            date=str(dt.date()),
+                            setType="future",
+                            valueActual=None,
+                            valuePred=float(v),
+                        )
+                    )
+            except Exception:
+                pass
+        else:
+            # Для RF/GB зараз не будуємо future (можемо додати окремо пізніше, якщо реально треба)
+            pass
+
+    diagnostics: Dict[str, Any] = {
+        "meta": meta,
+        "series": series_diag,
+        "transforms": trans_info,
+        "base_variables": base_vars,
+        "targets": targets_diag,
+        "targets_exog": targets_exog,
+        "comparison": comparison,
+        "selection": selection_info,
     }
-    
-    df_stat = pd.DataFrame()
-    for c in df.columns:
-        df_stat[c] = _make_stationary_series(df[c], diags["series"][c])
-        
-    corr_matrices, edges = _compute_correlations(df_stat, req.max_lag)
-    correlations = {"matrices": corr_matrices, "edges": edges}
-    
-    base_vars, factors = _select_base_variables(df_stat, roles, edges, req.max_lag)
-    diags["base_variables"] = base_vars
-    
-    models_out = []
-    metrics_out = []
-    fc_base = []
-    fc_macro = []
-    base_futures = {}
-    
-    # A. Base
-    for base in base_vars:
-        diag = diags["series"][base]
-        cands, selected = _select_model(
-            base, df[base], None, None, diag, req.horizon, req.max_lag, True
-        )
-        if selected:
-            base_futures[base] = selected.y_pred_future
-            _record_results(base, cands, selected, models_out, metrics_out, fc_base, df)
 
-    # B. Target
-    diags["targets"] = {}
-    diags["targets_exog"] = {}
-    
-    for target in targets:
-        diag = diags["series"][target]
-        exog_data = {}
-        exog_fut_data = {}
-        exog_info = []
-        
-        for base in base_vars:
-            rel = [e for e in edges if e["source"]==base and e["target"]==target]
-            if not rel: continue
-            best_e = max(rel, key=lambda x: abs(x["r_at_best_lag"]))
-            lag = int(best_e["best_lag"])
-            
-            hist = df[base].values
-            fut = base_futures.get(base, np.array([]))
-            full = np.concatenate([hist, fut])
-            shifted = pd.Series(full).shift(lag).values
-            n = len(df)
-            exog_data[f"{base}_lag{lag}"] = shifted[:n]
-            exog_fut_data[f"{base}_lag{lag}"] = shifted[n:]
-            exog_info.append({"base": base, "lag": lag, "r": best_e["r_at_best_lag"]})
-            
-        exog_df = pd.DataFrame(exog_data, index=df.index).ffill().bfill() if exog_data else None
-        exog_fut_df = pd.DataFrame(exog_fut_data) if exog_fut_data else None
-        
-        diags["targets_exog"][target] = exog_info
-        
-        cands, selected = _select_model(
-            target, df[target], exog_df, exog_fut_df, diag, req.horizon, req.max_lag, True
-        )
-        
-        if selected:
-             _record_results(target, cands, selected, models_out, metrics_out, fc_macro, df)
-             
-             comp = _compare_horizons(target, df[target], exog_df, req.max_lag, True, diag)
-             if "comparison" not in diags: diags["comparison"] = {}
-             diags["comparison"][target] = comp
-             
-             diags["targets"][target] = {"lb_pvalue": selected.lb_pvalue, "residuals_ok": True}
+    # важливо: чистимо все, що йде в Dict[str, Any]
+    diagnostics_clean = _to_python(diagnostics)
+    correlations_clean = _to_python(correlations)
+    factors_clean = _to_python(factors)
 
-    return ExperimentResult(
-        diagnostics=_to_py(diags),
-        correlations=_to_py(correlations),
-        factors=_to_py(factors),
-        models=models_out,
-        forecasts=ForecastBundle(base=fc_base, macro=fc_macro),
-        metrics=metrics_out
+    resp = ExperimentResult(
+        diagnostics=diagnostics_clean,
+        correlations=correlations_clean,
+        factors=factors_clean,
+        models=models,
+        forecasts=forecasts,
     )
+    return resp
 
-def _record_results(name, cands, selected, models_out, metrics_out, fc_list, df):
-    for m in cands:
-        models_out.append(ModelInfo(
-            series_name=m.series_name, model_type=m.model_type,
-            params=_to_py(m.params), mase=_safe_num(m.mase),
-            smape=_safe_num(m.smape), rmse=_safe_num(m.rmse),
-            is_selected=(m is selected), reason=m.reason
-        ))
-        metrics_out.append(MetricRow(
-            series_name=m.series_name, model_type=m.model_type,
-            horizon=len(m.y_pred_future), mase=_safe_num(m.mase),
-            smape=_safe_num(m.smape), rmse=_safe_num(m.rmse)
-        ))
-    for dt, val in zip(selected.dates_train, selected.y_pred_train):
-        act = df.loc[dt, name] if dt in df.index else None
-        fc_list.append(ForecastPoint(series_name=name, date=dt.strftime("%Y-%m-%d"), value_actual=_safe_num(act), value_pred=_safe_num(val), lower_pi=None, upper_pi=None, set_type="train"))
-    for dt, val in zip(selected.dates_test, selected.y_pred_test):
-        act = df.loc[dt, name] if dt in df.index else None
-        fc_list.append(ForecastPoint(series_name=name, date=dt.strftime("%Y-%m-%d"), value_actual=_safe_num(act), value_pred=_safe_num(val), lower_pi=None, upper_pi=None, set_type="test"))
-    for dt, val in zip(selected.dates_future, selected.y_pred_future):
-        fc_list.append(ForecastPoint(series_name=name, date=dt.strftime("%Y-%m-%d"), value_actual=None, value_pred=_safe_num(val), lower_pi=None, upper_pi=None, set_type="future"))
+
+

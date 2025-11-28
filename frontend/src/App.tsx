@@ -10,6 +10,7 @@ const App: React.FC = () => {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loadingList, setLoadingList] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [reloadToken, setReloadToken] = useState(0);
 
   const loadList = async () => {
     setLoadingList(true);
@@ -17,9 +18,12 @@ const App: React.FC = () => {
     try {
       const data = await listExperiments();
       setExperiments(data);
-      if (!selectedId && data.length > 0) {
-        setSelectedId(data[0].id);
-      }
+
+      // Якщо selectedId ще не обрали — вибираємо перший з актуального списку
+      setSelectedId((prev) => {
+        if (prev) return prev;
+        return data.length > 0 ? data[0].id : null;
+      });
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } catch (err: any) {
       console.error(err);
@@ -34,15 +38,15 @@ const App: React.FC = () => {
   }, []);
 
   const handleCompleted = (experimentId: string) => {
-    // оновлюємо список і виділяємо новий експеримент
+    // навіть якщо id той самий — форсуємо перезавантаження деталей
     setSelectedId(experimentId);
-    void loadList();
+    setReloadToken((x) => x + 1);
+    void loadList(); // підтягнути оновлену назву/метрики в історію
   };
 
   return (
     <div className="App" style={{ display: "flex", minHeight: "100vh" }}>
       <div style={{ flex: "0 0 420px", borderRight: "1px solid #ddd" }}>
-        {/* <h1 style={{ padding: "0.5rem 1rem" }}>Prediction</h1> */}
         <ExperimentRunForm onExperimentCompleted={handleCompleted} />
 
         <div style={{ padding: "0.5rem 1rem" }}>
@@ -59,7 +63,11 @@ const App: React.FC = () => {
                   backgroundColor:
                     exp.id === selectedId ? "#eef" : "transparent",
                 }}
-                onClick={() => setSelectedId(exp.id)}
+                onClick={() => {
+                  setSelectedId(exp.id);
+                  setReloadToken((x) => x + 1);
+                  void loadList(); // 👈 при кліку теж оновлюємо список
+                }}
               >
                 <div style={{ fontWeight: 600 }}>{exp.name}</div>
                 <div style={{ fontSize: "0.8rem" }}>
@@ -80,7 +88,10 @@ const App: React.FC = () => {
 
       <div style={{ flex: "1 1 auto" }}>
         {selectedId ? (
-          <ExperimentDetails experimentId={selectedId} />
+          <ExperimentDetails
+            key={`${selectedId}-${reloadToken}`}
+            experimentId={selectedId}
+          />
         ) : (
           <div style={{ padding: "1rem" }}>
             Запусти перший експеримент або обери його зліва.

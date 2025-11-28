@@ -69,6 +69,7 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
   const targetNames: string[] = Object.keys(targetsInfo);
   const baseVars: string[] = (diag?.base_variables || []) as string[];
   const comparison = (diag?.comparison || {}) as any;
+  const selection = (diag?.selection || {}) as Record<string, any>;
 
   const correlations = (experiment?.correlations || {}) as any;
   const factors = (experiment?.factors || {}) as any;
@@ -154,6 +155,25 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
   };
 
   const sectionStyle: React.CSSProperties = { marginTop: "1.5rem" };
+
+  const explainRule = (rule?: string): string => {
+    switch (rule) {
+      case "linear_arima":
+        return "лінійна динаміка без сезонності, без exogenous → ARIMA";
+      case "linear_seasonal_sarima":
+        return "лінійна динаміка з вираженою сезонністю → SARIMA";
+      case "linear_with_exog_sarimax":
+        return "лінійна динаміка з інформативними exogenous → SARIMAX";
+      case "nonlinear_trees":
+        return "виявлено ознаки нелінійності → моделі на основі дерев (RF/GB)";
+      case "override_backtest_trees":
+        return "backtest показав кращу якість дерев → перехід до RF/GB";
+      case "override_backtest_linear":
+        return "backtest показав кращу якість іншого лінійного сімейства";
+      default:
+        return rule || "—";
+    }
+  };
 
   return (
     <div style={containerStyle}>
@@ -340,9 +360,207 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
         )}
       </section>
 
-      {/* 4. Вибір моделей (обрані за методом) */}
+      {/* 4. Як метод обирає модель для прогнозу */}
       <section style={sectionStyle}>
-        <h3>4. Вибір моделей (обрані за методом)</h3>
+        <h3>4. Як метод обирає модель для прогнозу</h3>
+
+        {targetNames.length === 0 && (
+          <div style={{ fontSize: "0.9rem" }}>
+            Таргетні ряди не визначені.
+          </div>
+        )}
+
+        {targetNames.map((t) => {
+          const cmpForTarget = comparison ? (comparison as any)[t] : null;
+          const selected = selectedBySeries[t];
+          const selInfo = selection[t] || {};
+
+          if (!cmpForTarget || !selected) return null;
+
+          const h1 = (cmpForTarget as any)[1];
+          if (!h1) return null;
+
+          const families = Object.keys(h1);
+
+          const rows = families
+            .map((fam) => {
+              const r = h1[fam] || {};
+              return {
+                family: fam,
+                mase: typeof r.mase === "number" ? r.mase : null,
+                smape: typeof r.smape === "number" ? r.smape : null,
+                rmse: typeof r.rmse === "number" ? r.rmse : null,
+              };
+            })
+            .filter((r) => r.mase != null && isFinite(r.mase as number))
+            .sort((a, b) => (a.mase as number) - (b.mase as number));
+
+          if (!rows.length) return null;
+
+          const best = rows[0];
+
+          const selectedFamily = (() => {
+            const mt = selected.modelType;
+            if (mt === "GBR" || mt === "GB") return "GB";
+            if (mt === "RF") return "RF";
+            if (mt === "SARIMAX") return "SARIMAX";
+            if (mt === "SARIMA") return "SARIMA";
+            if (mt === "ARIMA") return "ARIMA";
+            return mt;
+          })();
+
+          const isConsistent = best.family === selectedFamily;
+
+          const hasExog = !!selInfo.has_exog;
+          const hasSeasonality = !!selInfo.has_seasonality;
+          const isNonlinear = !!selInfo.is_nonlinear;
+          const ruleText = explainRule(selInfo.rule);
+
+          const exogList = targetsExog[t] || [];
+
+          return (
+            <div
+              key={t}
+              style={{
+                border: "1px solid #000",
+                padding: "0.5rem",
+                marginBottom: "0.75rem",
+                fontSize: "0.85rem",
+              }}
+            >
+              <div style={{ marginBottom: "0.25rem" }}>
+                <strong>{t}</strong>
+              </div>
+
+              {/* Таблиця з поясненням правил вибору */}
+              <table
+                style={{
+                  ...tableStyle,
+                  fontSize: "0.8rem",
+                  marginBottom: "0.5rem",
+                }}
+              >
+                <tbody>
+                  <tr>
+                    <td style={tdStyle}>Сезонність (діагностика)</td>
+                    <td style={tdStyle}>{hasSeasonality ? "так" : "ні"}</td>
+                  </tr>
+                  <tr>
+                    <td style={tdStyle}>Ознаки нелінійності</td>
+                    <td style={tdStyle}>{isNonlinear ? "так" : "ні"}</td>
+                  </tr>
+                  <tr>
+                    <td style={tdStyle}>Exogenous-показники</td>
+                    <td style={tdStyle}>
+                      {hasExog && exogList.length
+                        ? exogList
+                          .map((e) => {
+                            const base = e.base ?? e.base_name ?? "?";
+                            const lag = typeof e.lag === "number" ? e.lag : 0;
+                            return `${base}${lag > 0 ? ` (lag ${lag})` : ""}`;
+                          })
+                          .join(", ")
+                        : hasExog
+                          ? "так"
+                          : "ні"}
+                    </td>
+                  </tr>
+                  <tr>
+                    <td style={tdStyle}>Обране сімейство моделей</td>
+                    <td style={tdStyle}>{selInfo.chosen_family || "—"}</td>
+                  </tr>
+                  <tr>
+                    <td style={tdStyle}>Правило вибору</td>
+                    <td style={tdStyle}>{ruleText}</td>
+                  </tr>
+                </tbody>
+              </table>
+
+              <div style={{ marginBottom: "0.25rem" }}>
+                Обрана нашим методом модель:{" "}
+                <strong>{selected.modelType}</strong>
+              </div>
+
+              <div style={{ marginBottom: "0.25rem" }}>
+                Найменший MASE на горизонті 1 місяць має:{" "}
+                <strong>
+                  {best.family} (MASE{" "}
+                  {best.mase != null ? best.mase.toFixed(3) : "—"})
+                </strong>
+                {isConsistent ? (
+                  <span> — збігається з вибором пайплайна.</span>
+                ) : (
+                  <span>
+                    {" "}
+                    — не збігається з поточним типом моделі, варто перевірити
+                    налаштування.
+                  </span>
+                )}
+              </div>
+
+              <details>
+                <summary>Порівняння кандидатів (горизонт 1)</summary>
+                <table
+                  style={{
+                    ...tableStyle,
+                    fontSize: "0.8rem",
+                    marginTop: "0.5rem",
+                  }}
+                >
+                  <thead>
+                    <tr>
+                      <th style={thStyle}>Сімейство</th>
+                      <th style={thStyle}>MASE</th>
+                      <th style={thStyle}>sMAPE</th>
+                      <th style={thStyle}>RMSE</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((r) => {
+                      const isBest = r.family === best.family;
+                      const isSel = r.family === selectedFamily;
+                      return (
+                        <tr key={r.family}>
+                          <td style={tdStyle}>
+                            {r.family}
+                            {isBest && (
+                              <span style={{ fontWeight: "bold" }}>
+                                {" "}
+                                (мінімальний MASE)
+                              </span>
+                            )}
+                            {isSel && !isBest && (
+                              <span style={{ fontStyle: "italic" }}>
+                                {" "}
+                                — вибір пайплайна
+                              </span>
+                            )}
+                          </td>
+                          <td style={tdStyle}>
+                            {r.mase != null ? r.mase.toFixed(3) : "—"}
+                          </td>
+                          <td style={tdStyle}>
+                            {r.smape != null
+                              ? r.smape.toFixed(2) + " %"
+                              : "—"}
+                          </td>
+                          <td style={tdStyle}>
+                            {r.rmse != null ? r.rmse.toFixed(3) : "—"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </details>
+            </div>
+          );
+        })}
+      </section>
+
+      {/* 5. Вибір моделей (обрані за методом) */}
+      <section style={sectionStyle}>
+        <h3>5. Вибір моделей (обрані за методом)</h3>
         <table style={tableStyle}>
           <thead>
             <tr>
@@ -385,9 +603,9 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
         </table>
       </section>
 
-      {/* 5. Оцінка ефективності комбінованого способу */}
+      {/* 6. Оцінка ефективності комбінованого способу (таргетні ряди) */}
       <section style={sectionStyle}>
-        <h3>5. Оцінка ефективності комбінованого способу (таргетні ряди)</h3>
+        <h3>6. Оцінка ефективності комбінованого способу (таргетні ряди)</h3>
         {targetNames.length === 0 ? (
           <div style={{ fontSize: "0.9rem" }}>
             Таргетні ряди не визначені.
@@ -444,7 +662,6 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
           </table>
         )}
 
-        {/* Пояснення, які базові змінні реально зайшли в exog */}
         {targetNames.map((t) => {
           const exogList = targetsExog[t] || [];
           if (!exogList.length) return null;
@@ -465,9 +682,9 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
         })}
       </section>
 
-      {/* 6. Прогнози (backtest + future) */}
+      {/* 7. Прогнози (backtest + future) */}
       <section style={sectionStyle}>
-        <h3>6. Прогнози</h3>
+        <h3>7. Прогнози</h3>
         {targetNames.length === 0 && (
           <div>Таргетні ряди не визначені в diagnostics.</div>
         )}
@@ -525,9 +742,7 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                     const xMax = xs.length - 1;
 
                     const scaleX = (i: number) =>
-                      xMax === xMin
-                        ? 0
-                        : ((i - xMin) / (xMax - xMin)) * 400;
+                      xMax === xMin ? 0 : ((i - xMin) / (xMax - xMin)) * 400;
                     const scaleY = (v: number) =>
                       ymax === ymin
                         ? 100
@@ -627,9 +842,9 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
         })}
       </section>
 
-      {/* 7. Порівняння моделей (горизонти 1–3 місяці) */}
+      {/* 8. Порівняння моделей (горизонти 1–3 місяці) */}
       <section style={sectionStyle}>
-        <h3>7. Порівняння моделей (горизонти 1–3 місяці)</h3>
+        <h3>8. Порівняння моделей (горизонти 1–3 місяці)</h3>
 
         {targetNames.map((t) => {
           const cmp = comparison ? (comparison as any)[t] : null;
@@ -642,7 +857,6 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
 
           const selected = selectedBySeries[t];
 
-          // Мапимо modelType → ключ у comparison
           const selectedFamilyKey: string | null = (() => {
             if (!selected || !selected.modelType) return null;
             const mt = selected.modelType;
@@ -672,7 +886,6 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                 const familyKeys = Object.keys(famRes);
                 if (!familyKeys.length) return null;
 
-                // стабільний порядок виводу
                 const orderedFamilies = [
                   "SeasonalNaive",
                   "ARIMA",
@@ -683,10 +896,10 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                   "OUR_METHOD",
                   ...familyKeys,
                 ].filter(
-                  (v, idx, arr) => familyKeys.includes(v) && arr.indexOf(v) === idx
+                  (v, idx, arr) =>
+                    familyKeys.includes(v) && arr.indexOf(v) === idx
                 );
 
-                // для обчислення % поліпшення по MASE
                 const selectedMetrics =
                   selectedFamilyKey && famRes[selectedFamilyKey]
                     ? famRes[selectedFamilyKey]
@@ -701,52 +914,53 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                   isFinite(selectedMetrics.mase)
                 ) {
                   const maseOur = selectedMetrics.mase;
-                  const smapeOur = selectedMetrics.smape; // Беремо наш sMAPE
+                  const smapeOur = selectedMetrics.smape;
 
                   for (const fam of orderedFamilies) {
                     if (fam === selectedFamilyKey) continue;
                     const rOther = famRes[fam];
-
                     if (!rOther) continue;
 
                     let textParts: string[] = [];
-                    let hasData = false;
+                    let improved = false;
 
-                    // --- 1. Порівняння MASE ---
+                    // 1. MASE: рахуємо тільки якщо ми кращі
                     if (
                       typeof rOther.mase === "number" &&
                       isFinite(rOther.mase) &&
-                      rOther.mase > 0
+                      rOther.mase > 0 &&
+                      maseOur < rOther.mase
                     ) {
-                      // Формула: (Чужий - Наш) / Чужий * 100
-                      // Якщо результат > 0, значить Наш менший (кращий) -> "+"
                       const impMase =
                         ((rOther.mase - maseOur) / rOther.mase) * 100.0;
-                      const sign = impMase > 0 ? "+" : "";
-                      textParts.push(`MASE ${sign}${impMase.toFixed(1)}%`);
-                      hasData = true;
+                      textParts.push(
+                        `MASE +${impMase.toFixed(1)}%`
+                      );
+                      improved = true;
                     }
 
-                    // --- 2. Порівняння sMAPE ---
+                    // 2. sMAPE: аналогічно
                     if (
                       typeof rOther.smape === "number" &&
                       typeof smapeOur === "number" &&
                       isFinite(rOther.smape) &&
-                      rOther.smape > 0
+                      rOther.smape > 0 &&
+                      smapeOur < rOther.smape
                     ) {
                       const impSmape =
                         ((rOther.smape - smapeOur) / rOther.smape) * 100.0;
-                      const sign = impSmape > 0 ? "+" : "";
-                      textParts.push(`sMAPE ${sign}${impSmape.toFixed(1)}%`);
-                      hasData = true;
+                      textParts.push(
+                        `sMAPE +${impSmape.toFixed(1)}%`
+                      );
+                      improved = true;
                     }
 
-                    if (hasData) {
+                    // Якщо по жодній метриці ми не кращі — нічого не додаємо
+                    if (improved && textParts.length > 0) {
                       improvements.push(`${fam}: ${textParts.join(", ")}`);
                     }
                   }
                 }
-
                 return (
                   <details
                     key={h}
@@ -824,7 +1038,7 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                           fontStyle: "italic",
                         }}
                       >
-                        Поліпшення нашого методу за MASE:&nbsp;
+                        Поліпшення нашого методу за MASE/sMAPE:&nbsp;
                         {improvements.join("; ")}.
                       </div>
                     )}
