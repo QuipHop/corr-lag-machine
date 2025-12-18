@@ -19,7 +19,7 @@ import { ExperimentsModule } from '../experiments/experiments.module';
         ]),
         ConfigModule.forRoot({ isGlobal: true }),
         PrismaModule,
-        ExperimentsModule, // усередині вже є ExperimentsController + ExperimentsService
+        ExperimentsModule,
     ],
     controllers: [
         HealthController, // /health для docker-compose

@@ -171,7 +171,7 @@ def _build_dataframe(req: ExperimentRequest) -> Tuple[pd.DataFrame, Dict[str, An
             vals += [None] * (max_len - len(vals))
         data[sp.name] = vals
 
-    # Якщо прийшли дати з фронту — юзаємо їх
+    # Якщо прийшли дати
     if req.dates:
         idx = pd.to_datetime(req.dates[:max_len])
     else:
@@ -251,7 +251,7 @@ def _acf_at_lag(x: pd.Series, lag: int) -> float:
 
 
 def _format_transform(info: Dict[str, Any]) -> str:
-    """Людське представлення трансформацій: log/diff/seas."""
+    """трансформацій: log/diff/seas."""
     parts: List[str] = []
     if info.get("log"):
         parts.append("log")
@@ -329,9 +329,6 @@ def _compute_series_diagnostics(
             "kurtosis": kurt,
             "transform": transform_label,
             "is_nonlinear": is_nonlinear,
-            # Якщо хочеш дебажити — можна також вивести:
-            # "nonlinear_shape": nonlinear_shape,
-            # "nonlinear_spearman": nonlinear_spearman,
         }
     return out
 
@@ -822,7 +819,7 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
     factors = {"vif": vif}
 
     # 5. Walk-forward backtest для порівняння сімейств (але НЕ для вибору класу)
-    horizons = [1, 2, 3]
+    horizons = [1, 2, 3, 6, 12]
     comparison: Dict[str, Any] = {}
     models: List[ModelInfo] = []
     targets_diag: Dict[str, Any] = {}
@@ -920,11 +917,11 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
                 chosen_family = best_fam
                 if best_fam in ["RF", "GB"]:
                     chosen_rule = "override_backtest_trees"
-                    is_nonlinear = True  # щоб у діагностиці відображалось чесно
+                    is_nonlinear = True 
                 else:
                     chosen_rule = "override_backtest_linear"
 
-        # --- 8. Зберігаємо інфу для ЮІ (чому так) ---
+        # --- 8. Зберігаємо інфу для ЮІ ---
         selection_info[t] = {
             "has_exog": has_exog,
             "has_seasonality": has_seasonality,
@@ -972,7 +969,7 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
             )
         )
 
-        # --- 7. Фінальна модель + Ljung–Box + прогнози (як у тебе було) ---
+        # --- 7. Фінальна модель + Ljung–Box + прогнози ---
         y = df_imp[t].dropna()
         n = len(y)
         horizon = req.horizon
@@ -1041,7 +1038,7 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
             for col in exog_cols:
                 targets_exog[t].append({"base": col, "lag": 0})
 
-        # Прогнози для ARIMA/SARIMA/SARIMAX (дерева як forecast на future можемо додати окремо)
+        # Прогнози для ARIMA/SARIMA/SARIMAX
         if model_type in ["ARIMA", "SARIMA", "SARIMAX"]:
             if req.frequency == "M":
                 s = 12
@@ -1122,7 +1119,7 @@ def run_full_experiment(req: ExperimentRequest) -> ExperimentResult:
             except Exception:
                 pass
         else:
-            # Для RF/GB зараз не будуємо future (можемо додати окремо пізніше, якщо реально треба)
+            # Для RF/GB
             pass
 
     diagnostics: Dict[str, Any] = {

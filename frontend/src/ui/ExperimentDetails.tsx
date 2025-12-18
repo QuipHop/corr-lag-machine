@@ -73,6 +73,47 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
 
   const correlations = (experiment?.correlations || {}) as any;
   const factors = (experiment?.factors || {}) as any;
+  const familyKeyFromModelType = (mt?: string | null): string | null => {
+    if (!mt) return null;
+    if (mt === "GBR" || mt === "GB") return "GB";
+    if (mt === "RF") return "RF";
+    if (mt === "SARIMAX") return "SARIMAX";
+    if (mt === "SARIMA") return "SARIMA";
+    if (mt === "ARIMA") return "ARIMA";
+    if (mt === "SeasonalNaive") return "SeasonalNaive";
+    return mt;
+  };
+
+  const getMetricsFromComparisonH1 = (
+    seriesName: string,
+    modelType: string | null | undefined
+  ): { mase: number | null; smape: number | null; rmse: number | null } => {
+    const cmpForSeries = comparison ? (comparison as any)[seriesName] : null;
+    if (!cmpForSeries) {
+      return { mase: null, smape: null, rmse: null };
+    }
+
+    const h1 = (cmpForSeries as any)[1];
+    if (!h1) {
+      return { mase: null, smape: null, rmse: null };
+    }
+
+    const famKey = familyKeyFromModelType(modelType);
+    if (!famKey) {
+      return { mase: null, smape: null, rmse: null };
+    }
+
+    const r = h1[famKey];
+    if (!r) {
+      return { mase: null, smape: null, rmse: null };
+    }
+
+    return {
+      mase: typeof r.mase === "number" ? r.mase : null,
+      smape: typeof r.smape === "number" ? r.smape : null,
+      rmse: typeof r.rmse === "number" ? r.rmse : null,
+    };
+  };
 
   const selectedModels = experiment?.models?.filter((m) => m.isSelected) ?? [];
 
@@ -414,7 +455,18 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
           const hasExog = !!selInfo.has_exog;
           const hasSeasonality = !!selInfo.has_seasonality;
           const isNonlinear = !!selInfo.is_nonlinear;
-          const ruleText = explainRule(selInfo.rule);
+
+          let ruleText = explainRule(selInfo.rule);
+
+          // Спеціальний випадок: нелінійність + exog + дерев'яний override
+          if (
+            selInfo.rule === "override_backtest_trees" &&
+            isNonlinear &&
+            hasExog
+          ) {
+            ruleText =
+              "виявлено нелінійність та інформативний exogenous-показник; backtest підтвердив перевагу дерев → обрано RF/GB";
+          }
 
           const exogList = targetsExog[t] || [];
 
@@ -582,23 +634,29 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                   ? "базовий ряд"
                   : "кандидат";
 
+              const metrics = getMetricsFromComparisonH1(m.seriesName, m.modelType);
+              const mase = metrics.mase ?? m.mase ?? null;
+              const smape = metrics.smape ?? m.smape ?? null;
+              const rmse = metrics.rmse ?? m.rmse ?? null;
+
               return (
                 <tr key={`${m.seriesName}-${m.modelType}`}>
                   <td style={tdStyle}>{m.seriesName}</td>
                   <td style={tdStyle}>{roleLabel}</td>
                   <td style={tdStyle}>{m.modelType}</td>
                   <td style={tdStyle}>
-                    {m.mase != null ? m.mase.toFixed(3) : ""}
+                    {mase != null ? mase.toFixed(3) : ""}
                   </td>
                   <td style={tdStyle}>
-                    {m.smape != null ? m.smape.toFixed(1) + " %" : ""}
+                    {smape != null ? smape.toFixed(1) + " %" : ""}
                   </td>
                   <td style={tdStyle}>
-                    {m.rmse != null ? m.rmse.toFixed(3) : ""}
+                    {rmse != null ? rmse.toFixed(3) : ""}
                   </td>
                 </tr>
               );
             })}
+
           </tbody>
         </table>
       </section>
@@ -632,18 +690,23 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
 
                 if (!sel) return null;
 
+                const metrics = getMetricsFromComparisonH1(t, sel.modelType);
+                const mase = metrics.mase ?? sel.mase ?? null;
+                const smape = metrics.smape ?? sel.smape ?? null;
+                const rmse = metrics.rmse ?? sel.rmse ?? null;
+
                 return (
                   <tr key={t}>
                     <td style={tdStyle}>{t}</td>
                     <td style={tdStyle}>{sel.modelType}</td>
                     <td style={tdStyle}>
-                      {sel.mase != null ? sel.mase.toFixed(3) : ""}
+                      {mase != null ? mase.toFixed(3) : ""}
                     </td>
                     <td style={tdStyle}>
-                      {sel.smape != null ? sel.smape.toFixed(1) + " %" : ""}
+                      {smape != null ? smape.toFixed(1) + " %" : ""}
                     </td>
                     <td style={tdStyle}>
-                      {sel.rmse != null ? sel.rmse.toFixed(3) : ""}
+                      {rmse != null ? rmse.toFixed(3) : ""}
                     </td>
                     <td style={tdStyle}>
                       {typeof lb === "number" ? lb.toFixed(3) : ""}
@@ -658,17 +721,25 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                   </tr>
                 );
               })}
+
             </tbody>
           </table>
         )}
 
         {targetNames.map((t) => {
+          const sel = selectedBySeries[t];
           const exogList = targetsExog[t] || [];
-          if (!exogList.length) return null;
+
+          // модель реально використовує exogenous?
+          const modelUsesExog =
+            sel && (sel.modelType === "SARIMAX" || sel.modelType === "OUR_EXOG_MODEL");
+
+          if (!modelUsesExog || !exogList.length) return null;
+
           return (
             <div key={t} style={{ marginTop: "0.5rem", fontSize: "0.85rem" }}>
               <strong>
-                Для ряду {t} в комбінованому способі використано exogenous:
+                Для ряду {t} у фінальній моделі використано exogenous:
               </strong>{" "}
               {exogList
                 .map((e) => {
@@ -680,6 +751,7 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
             </div>
           );
         })}
+
       </section>
 
       {/* 7. Прогнози (backtest + future) */}
@@ -917,14 +989,25 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                   const smapeOur = selectedMetrics.smape;
 
                   for (const fam of orderedFamilies) {
+                    // 0. Пропускаємо наш метод
                     if (fam === selectedFamilyKey) continue;
+
+                    // 1. Пропускаємо тривіальні базлайни,
+                    //    які не цікаві як "конкуренти"
+                    const isBaseline =
+                      fam === "SeasonalNaive" ||
+                      fam === "Naive" ||
+                      fam === "Drift";
+
+                    if (isBaseline) continue;
+
                     const rOther = famRes[fam];
                     if (!rOther) continue;
 
                     let textParts: string[] = [];
                     let improved = false;
 
-                    // 1. MASE: рахуємо тільки якщо ми кращі
+                    // 2. MASE: тільки якщо наш метод реально кращий
                     if (
                       typeof rOther.mase === "number" &&
                       isFinite(rOther.mase) &&
@@ -933,13 +1016,17 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                     ) {
                       const impMase =
                         ((rOther.mase - maseOur) / rOther.mase) * 100.0;
+                      const ratioMase = rOther.mase / maseOur;
+
                       textParts.push(
-                        `MASE +${impMase.toFixed(1)}%`
+                        `MASE нижчий на ${impMase.toFixed(
+                          1
+                        )}%, помилка ≈ у ${ratioMase.toFixed(1)} раз(и) менша`
                       );
                       improved = true;
                     }
 
-                    // 2. sMAPE: аналогічно
+                    // 3. sMAPE: аналогічно – тільки коли ми кращі
                     if (
                       typeof rOther.smape === "number" &&
                       typeof smapeOur === "number" &&
@@ -949,18 +1036,16 @@ export const ExperimentDetails: React.FC<Props> = ({ experimentId }) => {
                     ) {
                       const impSmape =
                         ((rOther.smape - smapeOur) / rOther.smape) * 100.0;
-                      textParts.push(
-                        `sMAPE +${impSmape.toFixed(1)}%`
-                      );
+                      textParts.push(`sMAPE нижчий на ${impSmape.toFixed(1)}%`);
                       improved = true;
                     }
 
-                    // Якщо по жодній метриці ми не кращі — нічого не додаємо
                     if (improved && textParts.length > 0) {
-                      improvements.push(`${fam}: ${textParts.join(", ")}`);
+                      improvements.push(`${fam}: ${textParts.join("; ")}`);
                     }
                   }
                 }
+
                 return (
                   <details
                     key={h}
